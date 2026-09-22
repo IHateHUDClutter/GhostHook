@@ -7,9 +7,8 @@ and loads compatible `.asi` plugins from `GhostHookPlugins/`.
 
 ## Beta status and supported builds
 
-The initial GhostHook TU25 beta has completed final release validation and is
-ready for publication. The runtime remains frozen; packaging and publication
-are the remaining release steps.
+The GhostHook TU25 beta includes the validated native-menu startup update.
+The public ScriptHook API/ABI remains compatible with existing plugins.
 
 Normal GhostHook startup accepts these executable fingerprints and rejects
 unsupported timestamp/SizeOfImage combinations:
@@ -23,6 +22,14 @@ Build acceptance does not imply identical feature availability on both builds.
 The restored frame-callback implementation is currently implemented and
 validated on TU25; registration is refused on unsupported builds or a hook
 signature mismatch.
+
+## Native menu startup
+
+Native menu startup has been significantly improved. Repeated menu
+initialization delays have been reduced, and startup is substantially more
+consistent. The first launch after installing or updating GhostHook may take
+longer than normal for the menu to appear. Subsequent launches should
+initialize faster and more consistently.
 
 ## Known compatibility issue
 
@@ -266,6 +273,14 @@ is exactly the wrong turn we would have taken.
 The addresses here are our own, since this build is newer than any in
 their table, but the reverse engineering that made them meaningful is
 theirs.
+
+Comparative work in [GameXueRen's GRW ScriptHook fork](https://github.com/GameXueRen/grw-scripthook)
+provided the lead for combined asset discovery, a `MEM_PRIVATE`-first scan,
+broad fallback, miss backoff, and earlier native-menu construction and batching
+concepts ([asset-scan commit](https://github.com/GameXueRen/grw-scripthook/commit/333ef39e2b51008fc04db89fac32b4b747ce6b67),
+[menu commit](https://github.com/GameXueRen/grw-scripthook/commit/42d3cf7485a734ae16abee1e5ac3f01c9001b823)).
+GhostHook independently integrated and adapted the relevant concepts; its
+own runtime testing established the production result.
 
 ## Licence
 

@@ -90,7 +90,9 @@ static uint32_t g_root = 0;
 static volatile uint32_t g_current = 0;
 static volatile int g_open = 0;
 static volatile int g_key = VK_F4;
-static volatile int g_greeted = 0;
+static volatile LONG g_greeted = 0;
+static volatile LONG g_playing = 0;
+static volatile LONG g_autoOpenPending = 0;
 static volatile int g_started = 0;
 static CRITICAL_SECTION g_lock;
 static volatile int g_lockReady = 0;
@@ -304,6 +306,7 @@ static int Complete(void) {
  * updates are text and position only. */
 static int BuildWidgets(void) {
     int i;
+    int batch = 0, ok = 1;
     float bodyScale[3] = { BODY_SCALE, BODY_SCALE, 1.0f };
     float headerScale[3] = { HEADER_SCALE, HEADER_SCALE, 1.0f };
     float creditScale[3] = { CREDIT_SCALE, CREDIT_SCALE, 1.0f };
@@ -318,45 +321,80 @@ static int BuildWidgets(void) {
                          MENU_W - PAD, BAR_H, C_BAR, 0.9f);
     g_ui.title = ShUiLabel(g_ui.panel, PAD, PAD, MENU_W - 2 * PAD,
                            TITLE_H, " ", C_TITLE);
-    ShUiSetV(g_ui.title, SH_P_SCALE, headerScale, 3);
     g_ui.credit = ShUiLabel(g_ui.panel, CREDIT_X, PAD + 12.0f, CREDIT_W,
                             TITLE_H, "Powered by Phiality's ScriptHook", C_TITLE);
-    ShUiSetV(g_ui.credit, SH_P_SCALE, creditScale, 3);
-    ShUiShow(g_ui.credit, 0);
     for (i = 0; i < VISIBLE; i++) {
         g_ui.name[i] = ShUiLabel(g_ui.panel, PAD + 8.0f, RowY(i),
                                  MENU_W - VALUE_W - PAD, ROW_H, " ",
                                  C_ROW);
-        ShUiSetV(g_ui.name[i], SH_P_SCALE, bodyScale, 3);
         g_ui.value[i] = ShUiLabel(g_ui.panel, MENU_W - PAD - VALUE_W,
                                   RowY(i), VALUE_W, ROW_H, " ", C_ROW);
-        ShUiSetV(g_ui.value[i], SH_P_SCALE, bodyScale, 3);
     }
     g_ui.footer = ShUiLabel(g_ui.panel, PAD, RowY(0), MENU_W - 2 * PAD,
                             ROW_H, " ", C_FOOT);
-    ShUiSetV(g_ui.footer, SH_P_SCALE, bodyScale, 3);
     g_ui.status = ShUiLabel(g_ui.panel, PAD, RowY(0), MENU_W - 2 * PAD,
                             ROW_H, " ", C_STATUS);
-    ShUiSetV(g_ui.status, SH_P_SCALE, bodyScale, 3);
 
     /* Destroying the panel takes the subtree with it, so the
      * next tick starts clean instead of leaking slots. */
-    if (!Complete()) {
-        ShUiDestroy(g_ui.panel);
-        memset(&g_ui, 0, sizeof(g_ui));
-        return 0;
-    }
+    if (!Complete()) goto failed;
 
+    if (!ShUiBegin()) goto failed;
+    batch = 1;
+    if (!ShUiSetV(g_ui.title, SH_P_SCALE, headerScale, 3)) ok = 0;
+    if (!ShUiSetV(g_ui.credit, SH_P_SCALE, creditScale, 3)) ok = 0;
+    if (!ShUiShow(g_ui.credit, 0)) ok = 0;
     for (i = 0; i < VISIBLE; i++) {
-        ShUiShow(g_ui.name[i], 0);
-        ShUiShow(g_ui.value[i], 0);
+        if (!ShUiSetV(g_ui.name[i], SH_P_SCALE, bodyScale, 3)) ok = 0;
+        if (!ShUiSetV(g_ui.value[i], SH_P_SCALE, bodyScale, 3)) ok = 0;
+        if (!ShUiShow(g_ui.name[i], 0)) ok = 0;
+        if (!ShUiShow(g_ui.value[i], 0)) ok = 0;
     }
-    ShUiShow(g_ui.footer, 0);
-    ShUiShow(g_ui.status, 0);
-    ShUiShow(g_ui.panel, 0);
+    if (!ShUiSetV(g_ui.footer, SH_P_SCALE, bodyScale, 3)) ok = 0;
+    if (!ShUiSetV(g_ui.status, SH_P_SCALE, bodyScale, 3)) ok = 0;
+    if (!ShUiShow(g_ui.footer, 0)) ok = 0;
+    if (!ShUiShow(g_ui.status, 0)) ok = 0;
+    if (!ok) goto failed;
+    batch = 0;
+    if (!ShUiCommit()) goto failed;
+
     g_ui.built = 1;
     g_ui.shown = 0;
     return 1;
+
+failed:
+    if (batch) ShUiAbort();
+    if (g_ui.panel) ShUiDestroy(g_ui.panel);
+    memset(&g_ui, 0, sizeof(g_ui));
+    return 0;
+}
+
+static void TryAutoOpen(void) {
+    Menu *root;
+
+    if (!g_ui.built ||
+        !InterlockedCompareExchange(&g_playing, 0, 0) ||
+        !InterlockedCompareExchange(&g_autoOpenPending, 0, 0))
+        return;
+    if (InterlockedCompareExchange(&g_greeted, 0, 0)) {
+        InterlockedExchange(&g_autoOpenPending, 0);
+        return;
+    }
+
+    Lock();
+    root = MenuOf(g_root);
+    if (root && root->count > 0 &&
+        InterlockedCompareExchange(&g_playing, 0, 0) &&
+        InterlockedCompareExchange(&g_autoOpenPending, 0, 0) &&
+        InterlockedCompareExchange(&g_greeted, 1, 0) == 0) {
+        strncpy(root->status, "F4 opens this menu",
+                sizeof(root->status) - 1);
+        root->status[sizeof(root->status) - 1] = 0;
+        InterlockedExchange(&g_autoOpenPending, 0);
+        g_current = g_root;
+        g_open = 1;
+    }
+    Unlock();
 }
 
 static void SetTextIf(uint32_t id, char *have, int cap,
@@ -430,11 +468,16 @@ static DWORD WINAPI MenuThread(LPVOID p) {
 
         if (Pressed(g_key)) {
             g_open = !g_open;
-            if (g_open) g_current = g_root;
+            if (g_open) {
+                g_current = g_root;
+                InterlockedExchange(&g_greeted, 1);
+            }
+            InterlockedExchange(&g_autoOpenPending, 0);
         }
         ShMenuSuppressKeys(g_open, g_key);
         if (g_ui.built && g_ui.gen != ShUiGen()) DropWidgets();
         if (!g_ui.built && !BuildWidgets()) continue;
+        TryAutoOpen();
         if (!g_open) {
             if (g_ui.built && g_ui.shown) {
                 ShUiShow(g_ui.panel, 0);
@@ -630,29 +673,23 @@ SH_API int  ShMenuIsOpen(void) { return g_open; }
 
 SH_API void ShMenuOpen(int open) {
     EnsureMenu();
+    Lock();
     g_open = open ? 1 : 0;
     if (g_open) g_current = g_root;
+    if (g_open || InterlockedCompareExchange(&g_autoOpenPending, 0, 0))
+        InterlockedExchange(&g_greeted, 1);
+    InterlockedExchange(&g_autoOpenPending, 0);
+    Unlock();
 }
 
-/* Opened once per session on entering Playing, so the key
- * is discoverable without anyone being told it.
- */
-void ShMenuOnEnterPlaying(void) {
-    Menu *root;
-    int have = 0;
-
-    if (!g_started || g_greeted) return;
-    Lock();
-    root = MenuOf(g_root);
-    if (root) {
-        have = root->count > 0;
-        if (have)
-            strncpy(root->status, "F4 opens this menu",
-                    sizeof(root->status) - 1);
+/* Latch Playing independently of plugin registration. The menu
+ * thread consumes this only after the root and widgets are ready. */
+void ShMenuOnStateChanged(int playing) {
+    InterlockedExchange(&g_playing, playing ? 1 : 0);
+    if (!playing) {
+        InterlockedExchange(&g_autoOpenPending, 0);
+        return;
     }
-    Unlock();
-    if (!have) return;
-    g_greeted = 1;
-    g_current = g_root;
-    g_open = 1;
+    if (!InterlockedCompareExchange(&g_greeted, 0, 0))
+        InterlockedExchange(&g_autoOpenPending, 1);
 }

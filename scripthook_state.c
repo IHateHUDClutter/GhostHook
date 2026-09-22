@@ -36,7 +36,7 @@ extern int ShInPauseMenu(void);
 extern void ShPhysicsOnEnterPlaying(void);
 extern void ShCameraOnEnterPlaying(void);
 extern void ShHeadOnEnterPlaying(void);
-extern void ShMenuOnEnterPlaying(void);
+extern void ShMenuOnStateChanged(int playing);
 extern void ShUiOnEnterPlaying(void);
 extern void ShInvalidate(void);
 extern void ShInvalidateHealth(void);
@@ -206,14 +206,16 @@ SH_API int ShGetGameStateName(char *buf, int len) {
  * physics world has to be ready before plugins call.
  */
 static void OnStateChanged(uint32_t h) {
+    int playing = h == HASH_PLAYING || h == HASH_INGAME;
+
     ShInvalidate();
     ShInvalidateHealth();
     ShUiOnEnterPlaying();
-    if (h == HASH_PLAYING || h == HASH_INGAME) {
+    ShMenuOnStateChanged(playing);
+    if (playing) {
         ShPhysicsOnEnterPlaying();
         ShCameraOnEnterPlaying();
         ShHeadOnEnterPlaying();
-        ShMenuOnEnterPlaying();
     }
 }
 

@@ -186,6 +186,10 @@ static struct {
     uint64_t fontAsset, imageAsset, pool;
 } g_ctx;
 
+#define ASSET_SCAN_BACKOFF_MS 10000ULL
+static SRWLOCK g_assetLock = SRWLOCK_INIT;
+static ULONGLONG g_assetRetryAfter;
+
 /* batches: edits recorded per thread, one job per commit */
 typedef struct {
     int      op;
@@ -311,17 +315,38 @@ static uint64_t ScanVtable(uint64_t vt, ScanFn test, void *user) {
     return 0;
 }
 
-/* An asset is a PhoenixAtom object: GUID at +0x10, class
- * GUID at +0x30. One shot scan of the heap for the pair;
- * returns the object, 0 when that asset is not loaded. */
-static uint64_t ScanGuid(const uint8_t *guid, const uint8_t *cls) {
+/* An asset is a PhoenixAtom object: GUID at +0x10. Validate
+ * the live record again before publishing a copied match. */
+static uint64_t AssetAt(uint64_t rec, const uint8_t *guid) {
+    uint64_t obj;
+    SIZE_T got = 0;
+    uint8_t liveGuid[16];
+    char nm[96];
+    if (!Readable(rec, 0x28)) return 0;
+    if (!ReadProcessMemory(GetCurrentProcess(),
+                           (void *)(uintptr_t)(rec + 0x10),
+                           liveGuid, sizeof(liveGuid), &got) ||
+        got != sizeof(liveGuid) || memcmp(liveGuid, guid, 16) != 0)
+        return 0;
+    obj = RQ(rec);
+    if (!Readable(obj, 8)) return 0;
+    if (!ShPropRttiOf(obj, nm, sizeof(nm))) return 0;
+    if (!strstr(nm, "Asset")) return 0;
+    return rec;
+}
+
+/* Search both unresolved defaults in one address-space walk.
+ * The first pass is private memory only; the fallback retains
+ * the production region policy for any asset still missing. */
+static void ScanAssetPass(uint64_t *font, uint64_t *image, int privateOnly) {
     MEMORY_BASIC_INFORMATION mbi;
     uint8_t *scan = NULL;
 
-    while (VirtualQuery(scan, &mbi, sizeof(mbi))) {
+    while (VirtualQuery(scan, &mbi, sizeof(mbi)) && (!*font || !*image)) {
         uint8_t *next = (uint8_t *)mbi.BaseAddress + mbi.RegionSize;
         if (next <= scan) break;
         if (mbi.State == MEM_COMMIT &&
+            (!privateOnly || mbi.Type == MEM_PRIVATE) &&
             (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
                             PAGE_EXECUTE_READWRITE)) &&
             !(mbi.Protect & PAGE_GUARD) &&
@@ -336,19 +361,18 @@ static uint64_t ScanGuid(const uint8_t *guid, const uint8_t *cls) {
                 if (!ReadProcessMemory(GetCurrentProcess(), b + done,
                                        chunk, want, &got) || got < 0x40)
                     break;
-                for (o = 0; o + 0x40 <= got; o += 8) {
-                    uint64_t rec, obj;
-                    char nm[96];
-                    if (memcmp(chunk + o, guid, 16) != 0) continue;
-                    /* record {object, flags, guid}: the object
-                       must carry an Asset class vtable */
-                    rec = (uint64_t)(uintptr_t)(b + done + o) - 0x10;
-                    obj = RQ(rec);
-                    if (!Readable(obj, 8)) continue;
-                    if (!ShPropRttiOf(obj, nm, sizeof(nm))) continue;
-                    if (!strstr(nm, "Asset")) continue;
-                    (void)cls;
-                    return rec;
+                for (o = 0; o + 0x40 <= got && (!*font || !*image); o += 8) {
+                    uint64_t rec;
+                    if (!*font && memcmp(chunk + o, g_fontGuid, 16) == 0) {
+                        rec = (uint64_t)(uintptr_t)(b + done + o) - 0x10;
+                        rec = AssetAt(rec, g_fontGuid);
+                        if (rec) *font = rec;
+                    }
+                    if (!*image && memcmp(chunk + o, g_imageGuid, 16) == 0) {
+                        rec = (uint64_t)(uintptr_t)(b + done + o) - 0x10;
+                        rec = AssetAt(rec, g_imageGuid);
+                        if (rec) *image = rec;
+                    }
                 }
                 /* overlap so a pair on the chunk edge is seen */
                 done += (got > 0x38) ? got - 0x38 : got;
@@ -356,7 +380,36 @@ static uint64_t ScanGuid(const uint8_t *guid, const uint8_t *cls) {
         }
         scan = next;
     }
-    return 0;
+}
+
+static void FindDefaultAssets(void) {
+    uint64_t font, image;
+    ULONGLONG now;
+
+    AcquireSRWLockExclusive(&g_assetLock);
+    font = g_ctx.fontAsset;
+    image = g_ctx.imageAsset;
+    if (font && image) {
+        ReleaseSRWLockExclusive(&g_assetLock);
+        return;
+    }
+
+    now = GetTickCount64();
+    if (g_assetRetryAfter && now < g_assetRetryAfter) {
+        ReleaseSRWLockExclusive(&g_assetLock);
+        return;
+    }
+
+    ScanAssetPass(&font, &image, 1);
+    if (!font || !image) ScanAssetPass(&font, &image, 0);
+
+    if (!g_ctx.fontAsset && font) g_ctx.fontAsset = font;
+    if (!g_ctx.imageAsset && image) g_ctx.imageAsset = image;
+    if (!g_ctx.fontAsset || !g_ctx.imageAsset)
+        g_assetRetryAfter = GetTickCount64() + ASSET_SCAN_BACKOFF_MS;
+    else
+        g_assetRetryAfter = 0;
+    ReleaseSRWLockExclusive(&g_assetLock);
 }
 
 static int Nibble(char c) {
@@ -395,8 +448,11 @@ SH_API int ShUiSetDefaultFont(const char *guid) {
     uint8_t g[16];
     if (!guid || !ParseGuid(guid, g)) { ShSetError(SH_ERR_BAD_ARG); return 0; }
     Lock();
+    AcquireSRWLockExclusive(&g_assetLock);
     memcpy(g_fontGuid, g, 16);
     g_ctx.fontAsset = 0;
+    g_assetRetryAfter = 0;
+    ReleaseSRWLockExclusive(&g_assetLock);
     Unlock();
     return 1;
 }
@@ -405,8 +461,11 @@ SH_API int ShUiSetDefaultImage(const char *guid) {
     uint8_t g[16];
     if (!guid || !ParseGuid(guid, g)) { ShSetError(SH_ERR_BAD_ARG); return 0; }
     Lock();
+    AcquireSRWLockExclusive(&g_assetLock);
     memcpy(g_imageGuid, g, 16);
     g_ctx.imageAsset = 0;
+    g_assetRetryAfter = 0;
+    ReleaseSRWLockExclusive(&g_assetLock);
     Unlock();
     return 1;
 }
@@ -458,17 +517,7 @@ static int Resolve(int sid) {
     g_ctx.pool = RQ(G_POOL);
 
 
-    if (!g_ctx.fontAsset) {
-
-        g_ctx.fontAsset = ScanGuid(g_fontGuid, NULL);
-
-    }
-
-    if (!g_ctx.imageAsset) {
-
-        g_ctx.imageAsset = ScanGuid(g_imageGuid, NULL);
-
-    }
+    FindDefaultAssets();
 
     if (!g_ctx.fontAsset || !g_ctx.imageAsset) {
 

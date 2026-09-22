@@ -28,7 +28,8 @@ static Prop g_props[MAX_PROPS];
 static int  g_nProps;
 static char g_cls[MAX_CLASSES][NAME_LEN];
 static int  g_nCls;
-static int  g_resolved;
+static INIT_ONCE g_resolveOnce = INIT_ONCE_STATIC_INIT;
+static int  g_resolveOk;
 static int  g_sections;
 static uint64_t g_bytes;
 
@@ -141,7 +142,8 @@ static void Consider(uint64_t at) {
 /* One walk over the executable's data sections for the
  * 0x20 byte {accessorVtable, id | 0x80000000, set, get}
  * records the engine keeps per widget class. */
-int ShPropResolve(void) {
+static BOOL CALLBACK ResolveOnce(PINIT_ONCE once, PVOID param,
+                                 PVOID *context) {
     uint8_t *base = (uint8_t *)(uintptr_t)SH_IMG(0);
     IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
     IMAGE_NT_HEADERS *nt;
@@ -149,9 +151,11 @@ int ShPropResolve(void) {
     static uint8_t chunk[0x10000];
     int i;
 
-    if (g_resolved) return g_nProps > 0;
-    g_resolved = 1;
-    if (!ShReadableAddr(SH_IMG(0), 0x1000)) return 0;
+    (void)once; (void)param; (void)context;
+    if (!ShReadableAddr(SH_IMG(0), 0x1000)) {
+        g_resolveOk = 0;
+        return TRUE;
+    }
     nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
     sec = IMAGE_FIRST_SECTION(nt);
     for (i = 0; i < nt->FileHeader.NumberOfSections; i++) {
@@ -185,7 +189,14 @@ int ShPropResolve(void) {
             done += (got > 0x18) ? got - 0x18 : got;
         }
     }
-    return g_nProps > 0;
+    g_resolveOk = g_nProps > 0;
+    return TRUE;
+}
+
+int ShPropResolve(void) {
+    if (!InitOnceExecuteOnce(&g_resolveOnce, ResolveOnce, NULL, NULL))
+        return 0;
+    return g_resolveOk;
 }
 
 /* The widget's own class first, then Widget. */
@@ -216,6 +227,7 @@ int ShPropCount(void) {
 
 /* Scan diagnostics: sections seen, bytes read, records. */
 void ShPropStats(int *sections, uint64_t *bytes, int *records) {
+    ShPropResolve();
     *sections = g_sections; *bytes = g_bytes; *records = g_nProps;
 }
 

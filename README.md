@@ -62,15 +62,6 @@ the native UI: scenes, widgets, properties, input and reloads.
 | Overlay | Slots that pack themselves, drawn by the game |
 | Game state | Menu, loading, in game, transitions |
 
-The source repository includes these example mods; the runtime package does
-not bundle mods:
-
-- **hitfling** shoot a car, it launches into the air
-- **tpgun** shoot anywhere, you arrive there
-- **ui_sample** a window from the UI ABI alone: its own scene,
-  rows, a highlight bar, keys through the input callback, a
-  rebuild after a world reload (F7 toggles it)
-
 ## Building from source
 
 Use a MinGW-w64 x64 compiler and Make, for example in MSYS2 MINGW64.
@@ -85,7 +76,7 @@ The production DLL is written to `build/dinput8.dll`. The build also generates
 into the game directory automatically. The explicit `all` target builds the
 production DLL; bare `make` currently selects the build-directory target.
 
-`make sample` builds the native UI example. `make docs` generates the API
+`make docs` generates the API
 reference from the public header and guides using Doxygen.
 
 ## Installing and using GhostHook
@@ -125,7 +116,7 @@ worker thread rather than from `DllMain`, so a plugin can link
 `GetProcAddress` to also run on older loaders. The guide in
 [docs/plugins.md](docs/plugins.md) walks through both.
 
-The whole of the falling cars mod:
+For example, a vehicle hit callback can move the resolved vehicle root:
 
 ```c
 static void OnHit(const ShHit *hit, void *user) {
@@ -218,18 +209,6 @@ thread. `ShQueueCall` runs a call there and `ShQueueResult` collects
 it, usually on the next frame. The API uses this internally, so
 plugins rarely need it.
 
-## Hazards
-
-These are real, and each one cost a crash to find.
-
-- Two vehicles freeze the game if you enter them: an alpaca that the
-  engine classes as a vehicle, `0x40081214`, and an unused monster
-  truck, `0x40BA6E9D`. They are safe to spawn, not to ride.
-- Placing an entity outside the streamed region crashes the game.
-  Collision only exists within roughly 1500m of the player.
-- `ShPlaceEntity` carries riders on purpose, so moving a vehicle you
-  are sitting in takes you with it.
-
 ## Addressing
 
 Every engine address is stored as an RVA and resolved against the
@@ -267,9 +246,6 @@ scripthook_input.c    cursor freeze and the modifier poll stub
 scripthook_hud.c      overlay slots
 scripthook_menu.c     the shared F4 menu
 guard.c               landing pad for the spawn trampoline
-
-hitfling.c tpgun.c    the example mods
-ui_sample.c           the native UI example
 ```
 
 ## Credits / Upstream

@@ -8,10 +8,6 @@ gets a layer of its own, decides where that layer sits
 relative to the game's UI, and talks to widgets through the
 same property system the engine uses.
 
-`ui_sample.c` is the working example: a window with a title,
-four rows, a highlight bar, keys through the input callback
-and a rebuild after a world reload, in about a hundred lines.
-
 ## GhostHook menu controls
 
 The shared GhostHook menu opens automatically after initial in-game

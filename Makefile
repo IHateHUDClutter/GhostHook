@@ -9,70 +9,15 @@ endif
 OUTDIR = build
 IMPLIB = $(OUTDIR)/libscripthook.a
 
-.PHONY: all roulette fling tpgun spawner crazycars freecam fov fps \
-        chaos sample docs clean
+.PHONY: all docs clean
 
 $(OUTDIR):
 	mkdir -p $(OUTDIR)
-
-sample: $(OUTDIR)/ui_sample.asi
-
-$(OUTDIR)/ui_sample.asi: ui_sample.c scripthook.h $(OUTDIR)/dinput8.dll | $(OUTDIR)
-	$(CC) $(CFLAGS) -o $@ ui_sample.c \
-		-L$(OUTDIR) -lscripthook -luser32
 
 docs:
 	doxygen Doxyfile
 
 all: $(OUTDIR)/dinput8.dll
-
-roulette: $(OUTDIR)/tp_roulette.asi
-
-fling: $(OUTDIR)/hitfling.asi
-
-$(OUTDIR)/hitfling.asi: hitfling.c scripthook.h | $(OUTDIR)
-	$(CC) $(CFLAGS) -o $@ hitfling.c -lgdi32 -luser32
-
-freecam: $(OUTDIR)/freecam.asi
-
-$(OUTDIR)/freecam.asi: freecam.c scripthook.h | $(OUTDIR)
-	$(CC) $(CFLAGS) -o $@ freecam.c -lgdi32 -luser32
-
-fps: $(OUTDIR)/firstperson.asi
-
-$(OUTDIR)/firstperson.asi: firstperson.c scripthook.h | $(OUTDIR)
-	$(CC) $(CFLAGS) -o $@ firstperson.c -lgdi32 -luser32
-
-chaos: $(OUTDIR)/chaos.asi
-
-$(OUTDIR)/chaos.asi: chaos.c scripthook.h $(OUTDIR)/dinput8.dll | $(OUTDIR)
-	$(CC) $(CFLAGS) -o $@ chaos.c \
-		-L$(OUTDIR) -lscripthook -lgdi32 -luser32 -lwinmm
-
-fov: $(OUTDIR)/fov_changer.asi
-
-$(OUTDIR)/fov_changer.asi: fov_changer.c scripthook.h $(OUTDIR)/dinput8.dll | $(OUTDIR)
-	$(CC) $(CFLAGS) -o $@ fov_changer.c \
-		-L$(OUTDIR) -lscripthook -lgdi32 -luser32
-
-spawner: $(OUTDIR)/spawner.asi
-
-$(OUTDIR)/spawner.asi: spawner.c scripthook.h | $(OUTDIR)
-	$(CC) $(CFLAGS) -o $@ spawner.c -lgdi32 -luser32
-
-crazycars: $(OUTDIR)/CrazyCars.asi
-
-$(OUTDIR)/CrazyCars.asi: crazycars.c scripthook.h | $(OUTDIR)
-	$(CC) $(CFLAGS) -o $@ crazycars.c -lgdi32 -luser32
-
-tpgun: $(OUTDIR)/tpgun.asi
-
-$(OUTDIR)/tpgun.asi: tpgun.c scripthook.h | $(OUTDIR)
-	$(CC) $(CFLAGS) -o $@ tpgun.c -lgdi32 -luser32
-
-$(OUTDIR)/tp_roulette.asi: tp_roulette.c scripthook.h $(OUTDIR)/dinput8.dll | $(OUTDIR)
-	$(CC) $(CFLAGS) -o $@ tp_roulette.c \
-		-L$(OUTDIR) -lscripthook -lgdi32 -luser32
 
 $(OUTDIR)/dinput8.dll: loader.c scripthook_api.c scripthook_physics.c \
                        scripthook_health.c scripthook_state.c \

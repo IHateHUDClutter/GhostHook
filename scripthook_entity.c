@@ -34,7 +34,7 @@ extern int ShGetHealthEntity(uint64_t entity, uint32_t *cur,
                              uint32_t *max);
 
 static uint64_t ImgAddr(uint64_t rva) {
-    return (uint64_t)(uintptr_t)GetModuleHandleA(NULL) + rva;
+    return SH_IMG(rva);
 }
 
 /* Link type 0 means no parent, so this is a root. Any

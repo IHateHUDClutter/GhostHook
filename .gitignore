@@ -1,5 +1,4 @@
-# Build output. The Makefile writes binaries next to
-# GRW.exe via GAMEDIR, and out/ is the scratch target.
+# Build output. The current Makefile writes to local build/.
 out/
 *.o
 *.obj
@@ -7,3 +6,20 @@ out/
 # Editor and tool state
 .claude/
 __pycache__/
+
+# Current local build output
+
+build/
+*.log
+
+# Local research, probes, and backups
+/EntityFindProbe_v1.c
+/UiPropProbe_v1.c
+/GRWTU25Probe_v11.c
+/GRWMenuInitTiming_v*.c
+/GRWMenuTimingTrigger_v*.c
+/loader.c.phiality-backup
+/scripthook_scene_crash_backup.c
+
+# Generated API documentation
+docs/api/

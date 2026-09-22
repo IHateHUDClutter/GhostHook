@@ -123,6 +123,7 @@ static uint16_t HeadBone(uint64_t skel) {
     BoneOf_t boneOf;
     uint16_t idx;
 
+    if (!ShIsLegacyBuild()) return BONE_NONE;
     if (!ShReadableAddr(skel + SKEL_TABLE, 8)) return BONE_NONE;
     table = ShReadQ(skel + SKEL_TABLE);
     if (!table || !ShReadableAddr(table, 8)) return BONE_NONE;

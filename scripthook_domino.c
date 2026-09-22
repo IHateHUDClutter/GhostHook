@@ -39,6 +39,12 @@ extern int ShReadMem(uint64_t addr, void *out, size_t len);
 extern int ShRequireInGame(void);
 extern void ShSetError(int err);
 
+static int RequireLegacyDomino(void) {
+    if (ShIsLegacyBuild()) return 1;
+    ShSetError(SH_ERR_NO_CANDIDATE);
+    return 0;
+}
+
 /* Same test the API uses: an entity is its vtable. */
 #define SH_VT_ENTITY SH_IMG(0x39C6FC8)
 
@@ -70,6 +76,7 @@ static uint64_t WeatherObj(void) {
 }
 
 SH_API int ShTriggerLightning(void) {
+    if (!RequireLegacyDomino()) return 0;
     uint64_t wr;
     if (!ShRequireInGame()) return 0;
     wr = WeatherObj();
@@ -82,6 +89,7 @@ SH_API int ShTriggerLightning(void) {
  * *(env+0xE70)+0x164 and that slot reads back 0 at once, so
  * the request is ignored. Read only until that is solved. */
 SH_API float ShGetWetness(void) {
+    if (!RequireLegacyDomino()) return 0.0f;
     uint64_t world, sub;
     float v = 0.0f;
 
@@ -94,6 +102,7 @@ SH_API float ShGetWetness(void) {
 }
 
 SH_API int ShSetLightningFrequency(int enable, float value) {
+    if (!RequireLegacyDomino()) return 0;
     uint64_t wr;
     if (!ShRequireInGame()) return 0;
     wr = WeatherObj();
@@ -109,6 +118,7 @@ SH_API int ShSetLightningFrequency(int enable, float value) {
 /* ---- player mode bytes ---- */
 
 static int ModeByte(int off, int on) {
+    if (!RequireLegacyDomino()) return 0;
     uint64_t g = ShReadQ(DOM(RVA_PLAYER_MODE));
     if (!g || !ShReadableAddr(g + 0x28, 4)) {
         ShSetError(SH_ERR_NO_GLOBAL);
@@ -122,6 +132,7 @@ SH_API int ShSetGodMode(int on)   { return ModeByte(0x29, on); }
 SH_API int ShSetGhostMode(int on) { return ModeByte(0x2A, on); }
 
 SH_API int ShGetGodMode(void) {
+    if (!RequireLegacyDomino()) return 0;
     uint64_t g = ShReadQ(DOM(RVA_PLAYER_MODE));
     uint8_t v = 0;
     if (g) ShReadMem(g + 0x29, &v, 1);
@@ -131,6 +142,7 @@ SH_API int ShGetGodMode(void) {
 /* ---- explosion exclusion sphere ---- */
 
 SH_API int ShExplosionShield(const ShVec3 *at, float radius) {
+    if (!RequireLegacyDomino()) return 0;
     uint64_t mgr = ShReadQ(DOM(RVA_EXPL_MGR));
 
     if (!mgr) { ShSetError(SH_ERR_NO_GLOBAL); return 0; }
@@ -240,6 +252,7 @@ void ShDominoPump(void) {
  * already does the job. */
 
 SH_API int ShSetEntityPhysics(uint64_t entity, int on) {
+    if (!RequireLegacyDomino()) return 0;
     DomJob j;
     if (!IsEntity(entity)) return ShFail_NotEntity();
     memset(&j, 0, sizeof(j));
@@ -251,6 +264,7 @@ SH_API int ShSetEntityPhysics(uint64_t entity, int on) {
 
 SH_API int ShAttachEntity(uint64_t child, uint64_t parent,
                           const ShVec3 *offset) {
+    if (!RequireLegacyDomino()) return 0;
     DomJob j;
     if (!IsEntity(child) || !IsEntity(parent))
         return ShFail_NotEntity();
@@ -268,6 +282,7 @@ SH_API int ShAttachEntity(uint64_t child, uint64_t parent,
 }
 
 SH_API int ShDetachEntity(uint64_t child) {
+    if (!RequireLegacyDomino()) return 0;
     DomJob j;
     if (!IsEntity(child)) return ShFail_NotEntity();
     memset(&j, 0, sizeof(j));

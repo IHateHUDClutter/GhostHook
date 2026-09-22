@@ -1,8 +1,8 @@
-# Native UI {#ui}
+# GhostHook native UI {#ui}
 
 The UI calls build interfaces out of the engine's own widget
 classes, drawn by the game's UI renderer, inside scenes the
-ScriptHook DLL owns. Nothing is borrowed from the game's HUD:
+GhostHook DLL owns. Nothing is borrowed from the game's HUD:
 no template, no font name, no scene of the game's. A plugin
 gets a layer of its own, decides where that layer sits
 relative to the game's UI, and talks to widgets through the
@@ -11,6 +11,15 @@ same property system the engine uses.
 `ui_sample.c` is the working example: a window with a title,
 four rows, a highlight bar, keys through the input callback
 and a rebuild after a world reload, in about a hundred lines.
+
+## GhostHook menu controls
+
+The shared GhostHook menu opens automatically after initial in-game
+initialization. F4 toggles it, arrow keys navigate, Enter selects/confirms,
+and Backspace returns. Its private menu-key suppression does not broadly
+capture normal keyboard input; held closing keys are drained before release
+to the game. This is separate from the public scene-focus and keyboard-capture
+APIs described below, whose semantics are unchanged.
 
 ## Scenes
 
@@ -109,8 +118,9 @@ The focused scene receives key down, key up and pointer moves
 holds focus the keyboard is captured: the game's DirectInput
 keyboard device, which is where it reads WASD and the rest,
 reports nothing pressed. Escape, Alt, Tab, F4 and the Windows
-keys are never hidden, so the player can always reach the
-game's menu. Release focus when your window closes. The
+keys are exempt from that public capture layer. GhostHook's separate menu
+suppression can still consume F4 and Escape while needed. Release focus when
+your window closes. The
 callback's return value still marks a key as consumed.
 `ShBlockKey(vk, on)` hides one key without focus, and
 `ShCaptureKeys(on)` is the capture without a scene.

@@ -88,6 +88,10 @@ static volatile int g_modeSet = 0;
 static volatile uint32_t g_apply = 0;
 
 static uint8_t *g_camStub = NULL;
+static int g_camHooked;
+static volatile LONG g_camInstalled;
+static SRWLOCK g_installLock = SRWLOCK_INIT;
+static int ThunkPointsAtStub(void);
 static uint8_t  g_thunkOrig[5];
 
 static uint8_t *g_mgrStub = NULL;
@@ -393,18 +397,23 @@ static int MgrInstall(void) {
     int64_t rel;
     DWORD old;
 
-    if (g_mgrHooked) return 1;
     if (!ShReadableAddr(MGR_SITE, MGR_LEN)) return 0;
     if (at[0] != 0xE8) return 0;
-    if ((uint64_t)((int64_t)MGR_SITE + MGR_LEN
-                   + *(int32_t *)(at + 1)) != MGR_NEXT)
-        return 0;
-    if (!BuildMgrStub()) return 0;
+    rel = (int64_t)MGR_SITE + MGR_LEN + *(int32_t *)(at + 1);
+    g_mgrHooked = g_mgrStub && (uint64_t)rel == (uint64_t)(uintptr_t)g_mgrStub;
+    if (g_mgrHooked) return 1;
+    if ((uint64_t)rel != MGR_NEXT) return 0;
+    if (!g_mgrStub && !BuildMgrStub()) return 0;
 
     rel = (int64_t)(uintptr_t)g_mgrStub - ((int64_t)MGR_SITE + 5);
     if (rel > 0x7FFFFFFFLL || rel < -0x7FFFFFFFLL) return 0;
     if (!VirtualProtect(at, MGR_LEN, PAGE_EXECUTE_READWRITE, &old))
         return 0;
+    if (at[0] != 0xE8 || (uint64_t)((int64_t)MGR_SITE + MGR_LEN +
+            *(int32_t *)(at + 1)) != MGR_NEXT) {
+        VirtualProtect(at, MGR_LEN, old, &old);
+        return 0;
+    }
     *(int32_t *)(at + 1) = (int32_t)rel;
     VirtualProtect(at, MGR_LEN, old, &old);
     FlushInstructionCache(GetCurrentProcess(), at, MGR_LEN);
@@ -473,10 +482,17 @@ static int PatchThunk(void) {
     int64_t rel;
     DWORD old;
 
-    if (!g_camStub) return 0;
+    if (!g_camStub || !ShReadableAddr(CAM_THUNK, 5) || t[0] != 0xE9 ||
+        (uint64_t)((int64_t)CAM_THUNK + 5 + *(int32_t *)(t + 1)) != CAM_IMPL)
+        return 0;
     rel = (int64_t)(uintptr_t)g_camStub - ((int64_t)CAM_THUNK + 5);
     if (rel > 0x7FFFFFFFLL || rel < -0x7FFFFFFFLL) return 0;
     if (!VirtualProtect(t, 5, PAGE_EXECUTE_READWRITE, &old)) return 0;
+    if (t[0] != 0xE9 || (uint64_t)((int64_t)CAM_THUNK + 5 +
+            *(int32_t *)(t + 1)) != CAM_IMPL) {
+        VirtualProtect(t, 5, old, &old);
+        return 0;
+    }
     memcpy(g_thunkOrig, t, 5);
     *(int32_t *)(t + 1) = (int32_t)rel;
     VirtualProtect(t, 5, old, &old);
@@ -484,42 +500,47 @@ static int PatchThunk(void) {
     return 1;
 }
 
+static void RollbackThunk(void) {
+    uint8_t *t = (uint8_t *)(uintptr_t)CAM_THUNK;
+    DWORD old;
+    if (ThunkPointsAtStub() && VirtualProtect(t, 5, PAGE_EXECUTE_READWRITE, &old)) {
+        if (ThunkPointsAtStub()) {
+            memcpy(t + 1, g_thunkOrig + 1, 4);
+            FlushInstructionCache(GetCurrentProcess(), t, 5);
+        }
+        VirtualProtect(t, 5, old, &old);
+    }
+    g_camHooked = ThunkPointsAtStub();
+}
+
 SH_API int ShCameraHookInstall(void) {
     uint8_t *t = (uint8_t *)(uintptr_t)CAM_THUNK;
-    int64_t cur, rel;
-    DWORD old;
+    int ok = 0;
 
-    if (g_camStub) return 1;
-    if (!ShReadableAddr(CAM_THUNK, 5)) {
-        ShSetError(SH_ERR_HOOK_FAILED);
-        return 0;
+    AcquireSRWLockExclusive(&g_installLock);
+    g_camHooked = ThunkPointsAtStub();
+    if (!g_camHooked) {
+        InterlockedExchange(&g_camInstalled, 0);
+        if (!ShReadableAddr(CAM_THUNK, 5) || t[0] != 0xE9 ||
+            (uint64_t)((int64_t)CAM_THUNK + 5 + *(int32_t *)(t + 1)) != CAM_IMPL)
+            goto done;
+        if (!g_camStub && !BuildStub()) goto done;
+        if (!PatchThunk()) goto done;
+        g_camHooked = 1;
     }
-    if (t[0] != 0xE9) {
-        ShSetError(SH_ERR_HOOK_FAILED);
-        return 0;
-    }
-    cur = (int64_t)CAM_THUNK + 5 + *(int32_t *)(t + 1);
-    if ((uint64_t)cur != CAM_IMPL) {
-        ShSetError(SH_ERR_HOOK_FAILED);
-        return 0;
-    }
-    if (!BuildStub()) {
-        ShSetError(SH_ERR_HOOK_FAILED);
-        return 0;
-    }
-
-    if (!PatchThunk()) {
-        ShSetError(SH_ERR_HOOK_FAILED);
-        return 0;
-    }
+    g_mgrHooked = 0;
     if (!MgrInstall()) {
-        ShSetError(SH_ERR_HOOK_FAILED);
-        return 0;
+        InterlockedExchange(&g_camInstalled, 0);
+        RollbackThunk();
+        goto done;
     }
-    (void)rel;
-    (void)old;
-    ShSetError(SH_OK);
-    return 1;
+    InterlockedExchange(&g_camInstalled, 1);
+    ok = 1;
+done:
+    if (!ok) InterlockedExchange(&g_camInstalled, 0);
+    ReleaseSRWLockExclusive(&g_installLock);
+    ShSetError(ok ? SH_OK : SH_ERR_HOOK_FAILED);
+    return ok;
 }
 
 /* The patch is code, so it survives a level change. Verify
@@ -540,15 +561,11 @@ static int ThunkPointsAtStub(void) {
  */
 void ShCameraOnEnterPlaying(void) {
     g_cam = 0;
-    if (!g_camStub) {
-        ShCameraHookInstall();
-        return;
-    }
-    if (!ThunkPointsAtStub()) PatchThunk();
+    ShCameraHookInstall();
 }
 
 SH_API int ShCameraReady(void) {
-    return g_camStub != NULL && g_cam != 0;
+    return InterlockedCompareExchange(&g_camInstalled, 0, 0) != 0 && g_cam != 0;
 }
 
 SH_API uint64_t ShCameraCalls(void) { return g_calls; }

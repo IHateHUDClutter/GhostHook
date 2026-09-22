@@ -9,6 +9,8 @@
 #define SH_BUILD 1
 #include "scripthook.h"
 
+extern void ShMenuSuppressKeys(int on, int toggleVk);
+
 #define MENUS       24
 #define ITEMS       96
 #define LABEL       48
@@ -17,22 +19,27 @@
 #define OPTS        12
 
 /* Geometry in HUD pixels. */
-#define MENU_X      16.0f
-#define MENU_Y      16.0f
-#define MENU_W      400.0f
-#define PAD         16.0f
-#define TITLE_H     34.0f
-#define ROW_H       28.0f
-#define BAR_DY      -4.0f
-#define BAR_H       22.0f
-#define VALUE_W     150.0f
+#define MENU_X      20.0f
+#define MENU_Y      20.0f
+#define MENU_W      520.0f
+#define PAD         20.0f
+#define TITLE_H     44.0f
+#define ROW_H       34.0f
+#define BAR_DY      -5.0f
+#define BAR_H       27.0f
+#define VALUE_W     190.0f
+#define CREDIT_X     280.0f
+#define CREDIT_W     245.0f
+#define BODY_SCALE   1.20f
+#define HEADER_SCALE 1.60f
+#define CREDIT_SCALE 0.85f
 
-#define C_TITLE     0xFFD25Au
-#define C_ROW       0xD2D2D2u
-#define C_SEL       0x8CF0FFu
-#define C_FOOT      0x8C8C8Cu
+#define C_TITLE     0xFFFFFFu
+#define C_ROW       0xFFFFFFu
+#define C_SEL       0xFFFFFFu
+#define C_FOOT      0xFFFFFFu
 #define C_STATUS    0xA0E6A0u
-#define C_BAR       0x28465Au
+#define C_BAR       0x505050u
 
 enum { IT_ACTION = 0, IT_SUB, IT_TOGGLE, IT_NUMBER, IT_LIST };
 
@@ -74,6 +81,7 @@ typedef struct {
     char    footer[32];
     int     rows;
     int     sel;
+    int     isRoot;
     RowView row[VISIBLE];
 } View;
 
@@ -90,7 +98,7 @@ static volatile int g_lockReady = 0;
 /* Native widget ids, valid for one UI generation. */
 static struct {
     int      built, gen, shown;
-    uint32_t panel, title, bar, footer, status;
+    uint32_t panel, title, credit, bar, footer, status;
     uint32_t name[VISIBLE], value[VISIBLE];
     View     drawn;
 } g_ui;
@@ -245,6 +253,7 @@ static void Capture(View *v) {
 
     memset(v, 0, sizeof(*v));
     if (!m) return;
+    v->isRoot = (g_current == g_root);
     strncpy(v->title, m->title, LABEL - 1);
     strncpy(v->status, m->status, sizeof(v->status) - 1);
     for (i = m->top; i < m->count && i < m->top + VISIBLE; i++) {
@@ -284,7 +293,7 @@ static void DropWidgets(void) {
 static int Complete(void) {
     int i;
 
-    if (!g_ui.panel || !g_ui.bar || !g_ui.title) return 0;
+    if (!g_ui.panel || !g_ui.bar || !g_ui.title || !g_ui.credit) return 0;
     if (!g_ui.footer || !g_ui.status) return 0;
     for (i = 0; i < VISIBLE; i++)
         if (!g_ui.name[i] || !g_ui.value[i]) return 0;
@@ -295,27 +304,40 @@ static int Complete(void) {
  * updates are text and position only. */
 static int BuildWidgets(void) {
     int i;
+    float bodyScale[3] = { BODY_SCALE, BODY_SCALE, 1.0f };
+    float headerScale[3] = { HEADER_SCALE, HEADER_SCALE, 1.0f };
+    float creditScale[3] = { CREDIT_SCALE, CREDIT_SCALE, 1.0f };
 
     memset(&g_ui, 0, sizeof(g_ui));
     if (!ShUiReady()) return 0;
     g_ui.gen = ShUiGen();
     g_ui.panel = ShUiPanel(MENU_X, MENU_Y, MENU_W, 200.0f, 0x000000, 0.8f);
     if (!g_ui.panel) return 0;
+    ShUiShow(g_ui.panel, 0);
     g_ui.bar = ShUiImage(g_ui.panel, PAD / 2, RowY(0) + BAR_DY,
                          MENU_W - PAD, BAR_H, C_BAR, 0.9f);
     g_ui.title = ShUiLabel(g_ui.panel, PAD, PAD, MENU_W - 2 * PAD,
                            TITLE_H, " ", C_TITLE);
+    ShUiSetV(g_ui.title, SH_P_SCALE, headerScale, 3);
+    g_ui.credit = ShUiLabel(g_ui.panel, CREDIT_X, PAD + 12.0f, CREDIT_W,
+                            TITLE_H, "Powered by Phiality's ScriptHook", C_TITLE);
+    ShUiSetV(g_ui.credit, SH_P_SCALE, creditScale, 3);
+    ShUiShow(g_ui.credit, 0);
     for (i = 0; i < VISIBLE; i++) {
         g_ui.name[i] = ShUiLabel(g_ui.panel, PAD + 8.0f, RowY(i),
                                  MENU_W - VALUE_W - PAD, ROW_H, " ",
                                  C_ROW);
+        ShUiSetV(g_ui.name[i], SH_P_SCALE, bodyScale, 3);
         g_ui.value[i] = ShUiLabel(g_ui.panel, MENU_W - PAD - VALUE_W,
                                   RowY(i), VALUE_W, ROW_H, " ", C_ROW);
+        ShUiSetV(g_ui.value[i], SH_P_SCALE, bodyScale, 3);
     }
     g_ui.footer = ShUiLabel(g_ui.panel, PAD, RowY(0), MENU_W - 2 * PAD,
                             ROW_H, " ", C_FOOT);
+    ShUiSetV(g_ui.footer, SH_P_SCALE, bodyScale, 3);
     g_ui.status = ShUiLabel(g_ui.panel, PAD, RowY(0), MENU_W - 2 * PAD,
                             ROW_H, " ", C_STATUS);
+    ShUiSetV(g_ui.status, SH_P_SCALE, bodyScale, 3);
 
     /* Destroying the panel takes the subtree with it, so the
      * next tick starts clean instead of leaking slots. */
@@ -352,6 +374,11 @@ static void Sync(const View *v) {
     int i;
 
     SetTextIf(g_ui.title, d->title, LABEL, v->title);
+    if (v->isRoot != d->isRoot) {
+        if (g_ui.credit)
+            ShUiShow(g_ui.credit, v->isRoot);
+        d->isRoot = v->isRoot;
+    }
     for (i = 0; i < VISIBLE; i++) {
         const RowView *r = &v->row[i];
         RowView *dr = &d->row[i];
@@ -396,7 +423,6 @@ static void Sync(const View *v) {
 /* Keys are polled here, the engine draws the result. */
 static DWORD WINAPI MenuThread(LPVOID p) {
     View v;
-    int captured = -1;
     (void)p;
 
     for (;;) {
@@ -406,12 +432,9 @@ static DWORD WINAPI MenuThread(LPVOID p) {
             g_open = !g_open;
             if (g_open) g_current = g_root;
         }
-        /* an open menu owns the keyboard, however it opened */
-        if (g_open != captured) {
-            captured = g_open;
-            ShCaptureKeys(captured);
-        }
+        ShMenuSuppressKeys(g_open, g_key);
         if (g_ui.built && g_ui.gen != ShUiGen()) DropWidgets();
+        if (!g_ui.built && !BuildWidgets()) continue;
         if (!g_open) {
             if (g_ui.built && g_ui.shown) {
                 ShUiShow(g_ui.panel, 0);
@@ -419,7 +442,6 @@ static DWORD WINAPI MenuThread(LPVOID p) {
             }
             continue;
         }
-        if (!g_ui.built && !BuildWidgets()) continue;
 
         Lock();
         Navigate();
@@ -440,7 +462,7 @@ static void EnsureMenu(void) {
     g_started = 1;
     InitializeCriticalSection(&g_lock);
     g_lockReady = 1;
-    g_root = NewMenu("SCRIPTHOOK", 0);
+    g_root = NewMenu("GhostHook", 0);
     CreateThread(NULL, 0, MenuThread, NULL, 0, NULL);
 }
 

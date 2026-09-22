@@ -237,7 +237,6 @@ static uint8_t g_imageGuid[16] = {
 static void Lock(void) {
     if (!g_lockInit) {
         InitializeCriticalSection(&g_lock);
-        LogInit("scripthook_ui.log");
         g_lockInit = 1;
     }
     EnterCriticalSection(&g_lock);
@@ -422,29 +421,96 @@ static int DefaultScene(void) {
 
 /* assets, purge of dead widgets, then the scene */
 static int Resolve(int sid) {
-    uint64_t scene, root, rootPriv;
+    uint64_t scene = 0;
+    uint64_t root = 0;
+    uint64_t rootPriv = 0;
+    uint64_t rootVt = 0;
+    uint32_t state;
+    int inGame;
 
-    if (!g_enabled) { ShSetError(SH_ERR_NOT_IN_GAME); return 0; }
-    if (!ShIsInGame()) { ShSetError(SH_ERR_NOT_IN_GAME); return 0; }
-    if (ShGetGameStateHash() != HASH_PLAYING) {
+    inGame = ShIsInGame();
+    state = ShGetGameStateHash();
+
+
+    if (!g_enabled) {
+
+        ShSetError(SH_ERR_NOT_IN_GAME);
+        return 0;
+    }
+
+    if (!inGame) {
+
+        ShSetError(SH_ERR_NOT_IN_GAME);
+        return 0;
+    }
+
+    if (state != HASH_PLAYING) {
+
         ShSetError(SH_ERR_UI_NOT_READY);
         return 0;
     }
-    if (ShSceneLive(sid)) return 1;
+
+    if (ShSceneLive(sid)) {
+
+        return 1;
+    }
+
     g_ctx.pool = RQ(G_POOL);
-    if (!g_ctx.fontAsset) g_ctx.fontAsset = ScanGuid(g_fontGuid, NULL);
-    if (!g_ctx.imageAsset) g_ctx.imageAsset = ScanGuid(g_imageGuid, NULL);
+
+
+    if (!g_ctx.fontAsset) {
+
+        g_ctx.fontAsset = ScanGuid(g_fontGuid, NULL);
+
+    }
+
+    if (!g_ctx.imageAsset) {
+
+        g_ctx.imageAsset = ScanGuid(g_imageGuid, NULL);
+
+    }
+
     if (!g_ctx.fontAsset || !g_ctx.imageAsset) {
+
         ShSetError(SH_ERR_UI_ASSET);
         return 0;
     }
-    if (!g_ctx.pool) { ShSetError(SH_ERR_UI_NOT_READY); return 0; }
-    if (HaveZombies() && !RunJob(OP_PURGE, &g_w[0])) return 0;
-    if (!ShSceneEnsure(sid, &scene, &root, &rootPriv)) return 0;
-    if (!Readable(rootPriv, 0x240) || RQ(root) != VT_CONTAINER) {
+
+    if (!g_ctx.pool) {
+
+        ShSetError(SH_ERR_UI_NOT_READY);
+        return 0;
+    }
+
+    if (HaveZombies()) {
+
+        if (!RunJob(OP_PURGE, &g_w[0])) {
+
+            return 0;
+        }
+
+    }
+
+
+    if (!ShSceneEnsure(sid, &scene, &root, &rootPriv)) {
+
+        return 0;
+    }
+
+
+    if (root)
+        rootVt = RQ(root);
+
+
+    if (!Readable(rootPriv, 0x240) ||
+        rootVt != VT_CONTAINER) {
+
+
         ShSetError(SH_ERR_NO_CANDIDATE);
         return 0;
     }
+
+
     return 1;
 }
 
@@ -734,8 +800,6 @@ static uint64_t __attribute__((ms_abi)) Job(uint64_t op, uint64_t arg,
     ShSceneLock(scenePriv);
     r = JobBody((int)op, w);
     ShSceneUnlock(scenePriv);
-    Log("job op %d on thread %lu -> %llu", (int)op,
-        (unsigned long)GetCurrentThreadId(), (unsigned long long)r);
     return r;
 }
 
@@ -1011,7 +1075,6 @@ static int ValidParent(uint32_t scene, uint32_t parent) {
 void ShUiOnEnterPlaying(void) {
     int i;
     Lock();
-    Log("state change: gen %d to %d", g_ctx.gen, g_ctx.gen + 1);
     ShSceneInvalidate();
     g_ctx.gen++;
     for (i = 0; i < MAX_UI; i++) {
@@ -1056,7 +1119,7 @@ SH_API int ShUiReady(void) {
 
 SH_API uint32_t ShUiSceneCreate(const char *name, int order) {
     int sid = ShSceneAlloc(order);
-    Log("scene create %s order %d id %d", name ? name : "", order, sid);
+    (void)name;
     return (uint32_t)sid;
 }
 
@@ -1197,8 +1260,6 @@ static uint32_t Create(uint32_t scene, int kind, int op, uint32_t parent,
     Widget *wd;
     uint32_t id = 0;
 
-    /* These three used to return with no log, so a build
-     * that stopped part way said nothing about why. */
     if (scene == 0 || scene > MAX_SCENES) {
         ShSetError(SH_ERR_BAD_ARG);
         Log("create kind %d REFUSED: bad scene %u", kind, scene);
@@ -1236,10 +1297,6 @@ static uint32_t Create(uint32_t scene, int kind, int op, uint32_t parent,
     if (text) { strncpy(wd->text, text, MAX_TEXT - 1); }
     wd->alive = 1;
     if (!RunJob(op, wd)) { wd->alive = 0; id = 0; }
-    Log("create kind %d parent %u -> id %u handle %llx priv %llx "
-        "plate %llx gen %d", kind, parent, id,
-        (unsigned long long)wd->handle, (unsigned long long)wd->priv,
-        (unsigned long long)wd->plateHandle, g_ctx.gen);
     Unlock();
     return id;
 }
@@ -1577,7 +1634,6 @@ SH_API uint32_t ShUiTextureCreate(int w, int h, const uint8_t *rgba,
     g_tex[id - 1].obj = tc.obj;
     g_tex[id - 1].w = w; g_tex[id - 1].h = h;
     g_tex[id - 1].alive = 1;
-    Log("texture %u obj %llx %dx%d", id, (unsigned long long)tc.obj, w, h);
     Unlock();
     return id;
 }
@@ -1742,8 +1798,6 @@ SH_API int ShUiDestroy(uint32_t id) {
     Lock();
     w = Get(id);
     if (!w) { Unlock(); return 0; }
-    Log("destroy id %u kind %d handle %llx", id, w->kind,
-        (unsigned long long)w->handle);
     if (t_batch) {
         ok = Record(OP_DESTROY, id, NULL);
     } else {

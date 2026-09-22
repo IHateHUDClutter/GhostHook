@@ -1,22 +1,43 @@
-# GRW ScriptHook
+# GhostHook
 
-A ScriptHookV equivalent for **Ghost Recon Wildlands** (Definitive
-Edition). It loads as a `dinput8.dll` proxy, exposes a plain C ABI,
-and loads `.asi` plugins the same way ScriptHookV does.
+A TU25-compatible Ghost Recon Wildlands ScriptHook fork based on **Phiality / PhialsBasement's
+[GRW ScriptHook](https://github.com/PhialsBasement/grw-scripthook)**.
+GhostHook loads as a `dinput8.dll` proxy, exposes the ScriptHook plain C ABI,
+and loads compatible `.asi` plugins from `GhostHookPlugins/`.
 
-Everything here was found by decompiling the game in Ghidra. The
-engine has no scripting layer, no console and no exported hooks, so
-each capability below is a specific function or field that had to be
-located and verified in a running game.
+## Beta status and supported builds
 
-Developed and tested under Proton on Linux, though nothing in it is
-Wine specific.
+The initial GhostHook TU25 beta has completed final release validation and is
+ready for publication. The runtime remains frozen; packaging and publication
+are the remaining release steps.
+
+Normal GhostHook startup accepts these executable fingerprints and rejects
+unsupported timestamp/SizeOfImage combinations:
+
+| GRW executable | PE timestamp | SizeOfImage |
+| --- | --- | --- |
+| Legacy | `0x6A7C5143` | `0x18B09000` |
+| TU25 | `0x6A99768A` | `0x185BA000` |
+
+Build acceptance does not imply identical feature availability on both builds.
+The restored frame-callback implementation is currently implemented and
+validated on TU25; registration is refused on unsupported builds or a hook
+signature mismatch.
+
+## Known compatibility issue
+
+Immersive Healing is temporarily unavailable for the initial GhostHook TU25 beta while a reproducible runtime interaction is investigated.
+
+The remaining current mod set completed a two-hour final stress run without
+reproducing the issue. This does not establish universal third-party plugin
+compatibility or exhaustive runtime testing of every API.
 
 ## Documentation
 
-The full API reference, generated from `scripthook.h`, lives at
-<https://phialsbasement.github.io/grw-scripthook/api/>. It covers
-every call, grouped the way the header is.
+The current public API is defined by `scripthook.h`. Generate its reference
+with `make docs`; output is generated locally in `docs/api/` and is not tracked.
+The [upstream API reference](https://phialsbasement.github.io/grw-scripthook/api/)
+is useful background but may differ from the current GhostHook header.
 
 [docs/plugins.md](docs/plugins.md) is the plugin author's guide:
 how loading works, which threads call you, and the rules that keep
@@ -41,7 +62,8 @@ the native UI: scenes, widgets, properties, input and reloads.
 | Overlay | Slots that pack themselves, drawn by the game |
 | Game state | Menu, loading, in game, transitions |
 
-Three example mods are included:
+The source repository includes these example mods; the runtime package does
+not bundle mods:
 
 - **hitfling** shoot a car, it launches into the air
 - **tpgun** shoot anywhere, you arrive there
@@ -49,34 +71,57 @@ Three example mods are included:
   rows, a highlight bar, keys through the input callback, a
   rebuild after a world reload (F7 toggles it)
 
-## Building
+## Building from source
 
-Requires a MinGW cross compiler. On Arch that is
-`mingw-w64-gcc`; on Debian, `gcc-mingw-w64-x86-64`.
+Use a MinGW-w64 x64 compiler and Make, for example in MSYS2 MINGW64.
+From the public repository root:
 
 ```sh
-make            # dinput8.dll and test_plugin.asi
-make fling      # hitfling.asi
-make tpgun      # tpgun.asi
-make sample     # ui_sample.asi
-make QUIET=1    # same, without the four benign warning families
-make docs       # the API reference into docs/api (doxygen)
+make -B QUIET=1 build/dinput8.dll
 ```
 
-Output goes to `GAMEDIR`, set at the top of the Makefile, which
-should be the folder containing `GRW.exe`.
+The production DLL is written to `build/dinput8.dll`. The build also generates
+`build/libscripthook.a`, the developer import library. Output is not installed
+into the game directory automatically. The explicit `all` target builds the
+production DLL; bare `make` currently selects the build-directory target.
 
-## Installing
+`make sample` builds the native UI example. `make docs` generates the API
+reference from the public header and guides using Doxygen.
 
-Drop `dinput8.dll` next to `GRW.exe`, along with any `.asi` plugins.
-The proxy forwards every DirectInput8 export to the real system DLL,
-so the game behaves normally with or without plugins present.
+## Installing and using GhostHook
+
+1. Copy GhostHook's `dinput8.dll` beside `GRW.exe`.
+2. Launching GhostHook automatically creates `GhostHookPlugins/` if missing.
+3. Put GhostHook-compatible `.asi` plugins inside `GhostHookPlugins/`.
+4. Root-level `.asi` files are intentionally ignored.
+5. After initialization, press F4 to open or close the GhostHook menu.
+
+Typical layout:
+
+```text
+Ghost Recon Wildlands/
+    GRW.exe
+    dinput8.dll
+    GhostHookPlugins/
+        ExampleMod.asi
+        ExampleMod.ini
+```
+
+GhostHook automatically opens its menu after the initial in-game initialization
+completes. Arrow keys navigate, Enter selects/confirms, and Backspace returns.
+Menu-owned keys are suppressed while needed without broadly locking normal
+keyboard input.
+
+GhostHook does not relocate or centrally manage plugin INI files. Most current
+plugins resolve their INI beside their own ASI, as in the example above.
+Individual plugins may use a different path according to their implementation;
+follow each plugin's instructions.
 
 ## Writing a mod
 
 A plugin is a DLL named `.asi`. The loader runs plugins from a
 worker thread rather than from `DllMain`, so a plugin can link
-`libscripthook.a` and call the API directly, or resolve it through
+`build/libscripthook.a` and call the API directly, or resolve it through
 `GetProcAddress` to also run on older loaders. The guide in
 [docs/plugins.md](docs/plugins.md) walks through both.
 
@@ -94,14 +139,18 @@ while (!ShIsInGame() || !ShHitHookInstall()) Sleep(500);
 ShOnHit(OnHit, NULL, 0);
 ```
 
-Receivers are called on a worker thread the API owns, so any API
-call is legal inside one. `hit->root` is already resolved for you,
+Receivers are called on a worker thread the API owns. Follow each API
+function's documented requirements when calling it from a receiver. `hit->root` is already resolved for you,
 because bullets usually strike a child part rather than the vehicle.
 
 ## The ABI
 
-`scripthook.h` is the only header a mod needs. Every call returns 1
-on success and 0 on failure, with `ShLastError` giving the reason.
+GhostHook preserves the existing public ScriptHook API/ABI.
+`scripthook.h` is the authoritative public header. `SH_API_VERSION` remains 1,
+and the current GhostHook DLL exports all 240/240 declared public functions.
+Return values and error behavior are documented per function in that header.
+The import library is developer-facing; ordinary users do not need it.
+See the plugin guide for TU25 frame callbacks and their threading limits.
 
 ```
 player        ShGetPlayer ShGetPlayerPosition ShTeleportPlayer
@@ -219,15 +268,15 @@ scripthook_hud.c      overlay slots
 scripthook_menu.c     the shared F4 menu
 guard.c               landing pad for the spawn trampoline
 
-test_plugin.c         a REPL on port 9999, every debugging command
 hitfling.c tpgun.c    the example mods
 ui_sample.c           the native UI example
 ```
 
-`test_plugin.c` is large because it accumulated every experiment
-used to find the rest. It is a research tool, not an example.
+## Credits / Upstream
 
-## Credits
+GhostHook is based on Phiality / PhialsBasement's
+[GRW ScriptHook](https://github.com/PhialsBasement/grw-scripthook).
+The upstream implementation and research form the basis of this fork.
 
 The camera work stands on **Firejumper93's**
 [GhostReconWildlandsVR](https://github.com/Firejumper93/GhostReconWildlandsVR),

@@ -329,6 +329,7 @@ SH_API int ShGetPlayerPosition(ShVec3 *out) {
         return 1;
     }
     /* Before the player is known, the global is all we have. */
+    if (!ShIsLegacyBuild()) return ShFail(SH_ERR_NO_GLOBAL);
     obj = ShQ(SH_PLAYER_GLOBAL);
     if (!obj) return ShFail(SH_ERR_NO_GLOBAL);
     if (!ShVec(obj + OFF_GLOBAL_TF + OFF_TF_POS, out))
@@ -342,6 +343,7 @@ SH_API int ShGetCameraEyePosition(ShVec3 *out) {
     uint64_t obj;
 
     if (!out) return ShFail(SH_ERR_BAD_ARG);
+    if (!ShIsLegacyBuild()) return ShFail(SH_ERR_NO_GLOBAL);
     obj = ShQ(SH_PLAYER_GLOBAL);
     if (!obj) return ShFail(SH_ERR_NO_GLOBAL);
     if (!ShVec(obj + OFF_GLOBAL_TF + OFF_TF_POS, out))
@@ -397,15 +399,15 @@ static int ShResolvePlayer(void) {
     uint64_t best = 0, root = 0;
 
     if (!ShGetPlayerPosition(&want)) {
-        ApiLog("resolve: no player position, global=%p",
-               (void *)(uintptr_t)ShQ(SH_PLAYER_GLOBAL));
+        if (ShIsLegacyBuild())
+            ApiLog("resolve: no player position, global=%p",
+                   (void *)(uintptr_t)ShQ(SH_PLAYER_GLOBAL));
         return 0;
     }
     /* Menus and loads park the position at the origin. */
     if (fabsf(want.x) < 1.0f && fabsf(want.y) < 1.0f
         && fabsf(want.z) < 1.0f)
         return ShFail(SH_ERR_NO_POSITION);
-    ApiLog("resolve: want %.2f %.2f %.2f", want.x, want.y, want.z);
 
     while (VirtualQuery(scan, &mbi, sizeof(mbi))) {
         uint8_t *next = (uint8_t *)mbi.BaseAddress + mbi.RegionSize;
@@ -460,10 +462,6 @@ found:
     g_player.root = root;
     g_resolved = 1;
     g_lastError = SH_OK;
-    ApiLog("resolved: entity %p node %p root %p",
-        (void *)(uintptr_t)g_player.entity,
-        (void *)(uintptr_t)g_player.node,
-        (void *)(uintptr_t)g_player.root);
     return 1;
 }
 

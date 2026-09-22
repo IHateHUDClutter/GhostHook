@@ -97,6 +97,8 @@ static SceneSlot g_s[MAX_SCENES];
 static CRITICAL_SECTION g_slock;
 static int g_slockInit;
 static uint8_t *g_stub;
+static int g_hooked;
+static SRWLOCK g_installLock = SRWLOCK_INIT;
 static uint8_t g_thunkOrig[5];
 static volatile uint32_t g_lastStamp;
 static volatile int64_t g_lastRender;
@@ -135,42 +137,12 @@ static int IsOurs(uint64_t scene) {
     return 0;
 }
 
-/* ---- diagnostics, SH_UI_DIAG builds only ---- */
-
-#ifdef SH_UI_DIAG
-typedef struct {
-    uint32_t frame, seq;
-    uint64_t scene, renderer;
-    uint8_t  ours;
-} CallRec;
-#define CRING 4096
-static volatile CallRec g_callRing[CRING];
-static volatile LONG g_callSeq;
-
-static void RecordCall(uint64_t scene, uint64_t renderer, int ours) {
-    LONG n = InterlockedIncrement(&g_callSeq);
-    volatile CallRec *c = &g_callRing[n % CRING];
-    c->frame = (uint32_t)g_frame; c->seq = (uint32_t)n;
-    c->scene = scene; c->renderer = renderer; c->ours = (uint8_t)ours;
-}
-
-SH_API int ShSceneCallRec(int i, uint32_t *frame, uint32_t *seq,
-                          uint64_t *scene, uint64_t *renderer, int *ours) {
-    volatile CallRec *c;
-    if (i < 0 || i >= CRING) return 0;
-    c = &g_callRing[i];
-    *frame = c->frame; *seq = c->seq; *scene = c->scene;
-    *renderer = c->renderer; *ours = c->ours;
-    return 1;
-}
-#else
-#define RecordCall(scene, renderer, ours) ((void)0)
-#endif
 
 /* ---- render hook ---- */
 
 static int NewFrame(void) {
-    uint64_t mgr = RQ(G_UIMGR);
+    /* TU25 uses the time fallback: the legacy UI-manager global is unvalidated. */
+    uint64_t mgr = ShIsTU25Build() ? 0 : RQ(G_UIMGR);
     uint32_t stamp = 0;
     LARGE_INTEGER now;
     int fresh;
@@ -201,14 +173,20 @@ static void RenderOurs(uint64_t renderer, int negatives) {
         }
         if (best < 0) return;
         done[best] = 1;
-        {
-            int32_t r2 = 0, r3 = 0;
+
+
+{
+                int32_t r2 = 0, r3 = 0;
+
             if (g_s[best].flippedFrame != g_frame) {
                 g_s[best].flippedFrame = g_frame;
                 ((Scene2)F_SCENE_FLIP)(g_s[best].handle, &r2);
             }
-            RecordCall(g_s[best].handle, renderer, 1);
-            ((Scene3)F_SCENE_RENDER)(g_s[best].handle, &r3, renderer);
+
+            ((Scene3)F_SCENE_RENDER)(g_s[best].handle,
+                                                &r3,
+                                                renderer);
+
         }
     }
 }
@@ -355,42 +333,65 @@ static int32_t *__attribute__((ms_abi)) RenderHook(uint64_t scene,
     int32_t *r;
     int fresh, passStart = 0;
 
+
     if (IsOurs(scene)) {
-        RecordCall(scene, renderer, 1);
-        return ((Scene3)F_SCENE_RENDER)(scene, res, renderer);
+        int32_t *ret;
+
+        ret = ((Scene3)F_SCENE_RENDER)(scene, res, renderer);
+
+
+        return ret;
     }
-    RecordCall(scene, renderer, 0);
+
+
     fresh = NewFrame();
+
     if (fresh) {
         PassEnded(g_prevCall);
+
         memcpy(g_ends, g_endsNext, sizeof(g_ends));
         g_nEnds = g_nEndsNext;
         g_nEndsNext = 0;
+
         memcpy(g_activePrev, g_activeCur, sizeof(g_activePrev));
         g_nActivePrev = g_nActiveCur;
         g_nActiveCur = 0;
+
         g_doneThisFrame = 0;
+
         InterlockedIncrement(&g_frame);
+
         TickAll();
+
         passStart = 1;
     } else if (InList(g_seen, g_nSeen, scene)) {
         PassEnded(g_prevCall);
         passStart = 1;
     }
-    if (g_nSeen < MAX_SEEN) g_seen[g_nSeen++] = scene;
+
+    if (g_nSeen < MAX_SEEN)
+        g_seen[g_nSeen++] = scene;
+
     NoteActive(scene);
-    /* under the game: before each pass's first scene */
-    if (passStart && renderer) RenderOurs(renderer, 1);
+
+    if (passStart && renderer)
+        RenderOurs(renderer, 1);
+
     r = ((Scene3)F_SCENE_RENDER)(scene, res, renderer);
+
     g_prevCall = scene;
-    /* over the game: after each pass's last scene */
+
     if (renderer) {
-        int hit = g_nEnds ? InList(g_ends, g_nEnds, scene) : !g_doneThisFrame;
+        int hit = g_nEnds
+            ? InList(g_ends, g_nEnds, scene)
+            : !g_doneThisFrame;
+
         if (hit) {
             g_doneThisFrame = 1;
             RenderOurs(renderer, 0);
         }
     }
+
     return r;
 }
 
@@ -399,28 +400,50 @@ static int InstallHook(void) {
     uint8_t *t = (uint8_t *)(uintptr_t)RENDER_THUNK;
     int64_t cur, rel;
     DWORD old;
-    int o = 0;
+    int o = 0, ok = 0;
 
-    if (g_stub) return 1;
-    if (!ShReadableAddr(RENDER_THUNK, 5) || t[0] != 0xE9) return 0;
+    AcquireSRWLockExclusive(&g_installLock);
+    g_hooked = 0;
+    if (!ShReadableAddr(RENDER_THUNK, 5) || t[0] != 0xE9) goto done;
     cur = (int64_t)RENDER_THUNK + 5 + *(int32_t *)(t + 1);
-    if ((uint64_t)cur != F_SCENE_RENDER) return 0;
+    if (g_stub && (uint64_t)cur == (uint64_t)(uintptr_t)g_stub) {
+        g_hooked = 1;
+        ok = 1;
+        goto done;
+    }
+    if ((uint64_t)cur != F_SCENE_RENDER) goto done;
 
-    g_stub = (uint8_t *)ShAllocNear(RENDER_THUNK);
-    if (!g_stub) return 0;
-    memset(g_stub, 0xCC, 0x1000);
-    g_stub[o++] = 0x48; g_stub[o++] = 0xB8;
-    *(uint64_t *)(g_stub + o) = (uint64_t)(uintptr_t)RenderHook; o += 8;
-    g_stub[o++] = 0xFF; g_stub[o++] = 0xE0;
+    if (!g_stub) {
+        g_stub = (uint8_t *)ShAllocNear(RENDER_THUNK);
+        if (!g_stub) goto done;
+        memset(g_stub, 0xCC, 0x1000);
+        g_stub[o++] = 0x48; g_stub[o++] = 0xB8;
+        *(uint64_t *)(g_stub + o) = (uint64_t)(uintptr_t)RenderHook; o += 8;
+        g_stub[o++] = 0xFF; g_stub[o++] = 0xE0;
+    }
 
     rel = (int64_t)(uintptr_t)g_stub - ((int64_t)RENDER_THUNK + 5);
-    if (rel > 0x7FFFFFFFLL || rel < -0x7FFFFFFFLL) return 0;
-    if (!VirtualProtect(t, 5, PAGE_EXECUTE_READWRITE, &old)) return 0;
+    if (rel > 0x7FFFFFFFLL || rel < -0x7FFFFFFFLL) goto done;
+    if (!VirtualProtect(t, 5, PAGE_EXECUTE_READWRITE, &old)) goto done;
+    if (t[0] != 0xE9 || (uint64_t)((int64_t)RENDER_THUNK + 5 +
+            *(int32_t *)(t + 1)) != F_SCENE_RENDER) {
+        VirtualProtect(t, 5, old, &old);
+        goto done;
+    }
     memcpy(g_thunkOrig, t, 5);
     *(int32_t *)(t + 1) = (int32_t)rel;
+    if (!FlushInstructionCache(GetCurrentProcess(), t, 5)) {
+        memcpy(t + 1, g_thunkOrig + 1, 4);
+        FlushInstructionCache(GetCurrentProcess(), t, 5);
+        VirtualProtect(t, 5, old, &old);
+        goto done;
+    }
     VirtualProtect(t, 5, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), t, 5);
-    return 1;
+    g_hooked = 1;
+    ok = g_hooked;
+done:
+    ReleaseSRWLockExclusive(&g_installLock);
+    return ok;
 }
 
 /* ---- jobs on the game thread ---- */
@@ -428,7 +451,6 @@ static int InstallHook(void) {
 static void DestroyEngineScene(uint64_t scene) {
     ((Fn3)F_SCENE_DTOR)(scene, 0, 0);
     ((Fn1)F_FREE)(scene);
-    Log("scene: destroyed %llx", (unsigned long long)scene);
 }
 
 static uint64_t __attribute__((ms_abi)) CreateJob(uint64_t sid, uint64_t b,
@@ -437,37 +459,91 @@ static uint64_t __attribute__((ms_abi)) CreateJob(uint64_t sid, uint64_t b,
     uint64_t scene, priv, root, rootP;
     int32_t res = 0;
     uint8_t idx;
-    (void)b; (void)c; (void)d;
 
-    if (s->dead) { DestroyEngineScene(s->dead); s->dead = 0; }
+    (void)b;
+    (void)c;
+    (void)d;
+
+
+    if (!InstallHook()) {
+        Log("scene: hook install failed");
+        return 0;
+    }
+
+    if (s->dead) {
+        DestroyEngineScene(s->dead);
+        s->dead = 0;
+    }
 
     scene = EAlloc(0x10);
-    if (!scene) return 0;
+
+    if (!scene) {
+        Log("scene: allocation failed");
+        return 0;
+    }
+
+
     ((Fn1)F_SCENE_CTOR)(scene);
+
+
     priv = RQ(scene + 8);
-    if (!priv) return 0;
-    ((Scene3)F_SCENE_SETCTX)(scene, &res, (uint64_t)(uintptr_t)&g_localizer);
-    /* the game's name resolver passes texture names through */
+
+
+    if (!priv) {
+        Log("scene: priv missing");
+        return 0;
+    }
+
+    ((Scene3)F_SCENE_SETCTX)(
+        scene,
+        &res,
+        (uint64_t)(uintptr_t)&g_localizer);
+
+
     g_resolver.vt = VT_GAME_RESOLVER;
-    ((Scene3)F_SCENE_SETRES)(scene, &res, (uint64_t)(uintptr_t)&g_resolver);
-    ((Scene2)F_SCENE_RESIZE)(scene, &res);
+
+    ((Scene3)F_SCENE_SETRES)(
+        scene,
+        &res,
+        (uint64_t)(uintptr_t)&g_resolver);
+
+
+    ((Scene2)F_SCENE_RESIZE)(
+        scene,
+        &res);
+
+
     root = RQ(priv + SP_ROOT);
     rootP = RQ(root + 0x20);
-    if (!root || !rootP) return 0;
-    if (RQ(rootP + 0x130) != scene)
-        ((Fn3)F_ATTACH)(rootP, scene, 0);
-    idx = *(uint8_t *)(uintptr_t)(priv + SP_IDX);
-    *(uint8_t *)(uintptr_t)(priv + SP_STATE + idx) = STATE_LIVE;
 
-    if (!InstallHook()) { Log("scene: hook install failed"); return 0; }
-    s->handle = scene; s->priv = priv;
-    s->rootH = root; s->rootP = rootP;
+
+    if (!root || !rootP) {
+        Log("scene: root chain failed");
+        return 0;
+    }
+
+    if (RQ(rootP + 0x130) != scene) {
+        ((Fn3)F_ATTACH)(
+            rootP,
+            scene,
+            0);
+
+    }
+
+    idx = *(uint8_t *)(uintptr_t)(priv + SP_IDX);
+
+    *(uint8_t *)(uintptr_t)(priv + SP_STATE + idx) =
+        STATE_LIVE;
+
+
+    s->handle = scene;
+    s->priv = priv;
+    s->rootH = root;
+    s->rootP = rootP;
     s->flippedFrame = -1;
     s->live = 1;
-    Log("scene %llu: created %llx priv %llx root %llx/%llx order %d",
-        (unsigned long long)sid, (unsigned long long)scene,
-        (unsigned long long)priv, (unsigned long long)root,
-        (unsigned long long)rootP, s->order);
+
+
     return 1;
 }
 
@@ -609,8 +685,6 @@ void ShSceneInvalidate(void) {
     SLock();
     for (i = 0; i < MAX_SCENES; i++) {
         if (!g_s[i].live) continue;
-        Log("scene %d: invalidated %llx", i + 1,
-            (unsigned long long)g_s[i].handle);
         if (g_s[i].dead) DestroyEngineScene(g_s[i].dead);
         g_s[i].dead = g_s[i].handle;
         g_s[i].live = 0;

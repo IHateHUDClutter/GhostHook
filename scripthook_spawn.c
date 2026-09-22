@@ -14,12 +14,13 @@
 #define RVA_MGR_GETTER   0x916DC40
 #define RVA_SPAWN        0x916D5E0
 #define RVA_COMMIT       0x916E590
+#define RVA_SPEC_VTABLE  0x0394A1E0
 
 /* A vehicle is named by a masked handle: the kind hash
  * below, with the vehicle id in the high dword.
  */
 #define VEH_KIND_HASH    0x8F2CBBBAu
-#define SPEC_VTABLE      SH_IMG(0x394A1E0)
+#define SPEC_VTABLE      ImgAddr(RVA_SPEC_VTABLE)
 #define SPEC_HANDLE_OFF  0x28
 #define COMMIT_MODE      7
 #define SPAWN_MODE       1
@@ -38,6 +39,15 @@ typedef uint64_t (__attribute__((ms_abi)) *Commit_t)(uint64_t, int,
                                                      uint64_t);
 
 static uint64_t ImgAddr(uint64_t rva) {
+    if (ShIsTU25Build()) {
+        switch (rva) {
+        case RVA_MGR_GETTER:  rva = 0x0990BAB0; break;
+        case RVA_SPAWN:       rva = 0x0990B0B0; break;
+        case RVA_COMMIT:      rva = 0x0990CA70; break;
+        case RVA_SPEC_VTABLE: rva = 0x0394A060; break;
+        default: break;
+        }
+    }
     return (uint64_t)(uintptr_t)GetModuleHandleA(NULL) + rva;
 }
 

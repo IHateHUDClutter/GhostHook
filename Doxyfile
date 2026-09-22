@@ -2,9 +2,9 @@
 # Run `doxygen` in src/; output lands in docs/api/.
 # Non-default options only.
 
-PROJECT_NAME           = "GRW ScriptHook"
-PROJECT_NUMBER         = 0.10.5
-PROJECT_BRIEF          = "Plugin API for Ghost Recon Wildlands"
+PROJECT_NAME           = "GhostHook"
+PROJECT_NUMBER         =
+PROJECT_BRIEF          = "Ghost Recon Wildlands ScriptHook fork"
 
 INPUT                  = scripthook.h docs/plugins.md docs/ui.md
 USE_MDFILE_AS_MAINPAGE = docs/plugins.md

@@ -21,6 +21,7 @@ typedef BOOL  (WINAPI *CursorPos_t)(LPPOINT);
 static AsyncKey_t  g_realKey = NULL;
 static CursorPos_t g_realPos = NULL;
 static int g_hooked = 0;
+static SRWLOCK g_installLock = SRWLOCK_INIT;
 
 static volatile uint32_t g_block = 0;
 static POINT g_frozen;
@@ -40,11 +41,44 @@ static int Escapes(int vk) {
 static volatile int g_capture;
 static int Install(void);
 
+static volatile int g_menuSuppress;
+static volatile int g_menuDrain;
+static volatile int g_menuToggle = VK_F4;
+
+static int MenuOwned(int vk) {
+    return vk == VK_UP || vk == VK_DOWN ||
+           vk == VK_LEFT || vk == VK_RIGHT ||
+           vk == VK_RETURN || vk == VK_BACK ||
+           vk == VK_ESCAPE || vk == g_menuToggle;
+}
+
+void ShMenuSuppressKeys(int on, int toggleVk) {
+    int vk;
+
+    g_menuToggle = toggleVk;
+    if (on) {
+        if (!g_menuSuppress) Install();
+        g_menuSuppress = 1;
+        g_menuDrain = 0;
+    } else {
+        if (g_menuSuppress) g_menuDrain = 1;
+        g_menuSuppress = 0;
+        if (g_menuDrain) {
+            for (vk = 1; vk < 256; ++vk)
+                if (MenuOwned(vk) && (GetAsyncKeyState(vk) & 0x8000))
+                    return;
+            g_menuDrain = 0;
+        }
+    }
+}
+
 /* one rule for the poll stub and the DirectInput wrapper */
 static int Suppressed(int vk) {
     uint32_t b = g_block;
 
-    if (vk <= 0 || vk >= 256 || Escapes(vk)) return 0;
+    if (vk <= 0 || vk >= 256) return 0;
+    if ((g_menuSuppress || g_menuDrain) && MenuOwned(vk)) return 1;
+    if (Escapes(vk)) return 0;
     if (g_capture) return 1;
     if (g_anyKeyBlock && g_keyBlock[vk]) return 1;
     if (!b) return 0;
@@ -95,34 +129,69 @@ static BOOL WINAPI PosStub(LPPOINT p) {
     return ok;
 }
 
-static int Redirect(uint64_t slot, void *stub, void **outOrig) {
-    DWORD old;
-    uint64_t cur;
+static int ValidTarget(void *target) {
+    MEMORY_BASIC_INFORMATION mbi;
+    DWORD access;
 
-    if (!ShReadableAddr(slot, 8)) return 0;
-    memcpy(&cur, (const void *)(uintptr_t)slot, 8);
-    if (cur < 0x10000ULL) return 0;
-
-    if (!VirtualProtect((void *)(uintptr_t)slot, 8,
-                        PAGE_READWRITE, &old))
+    if ((uintptr_t)target < 0x10000 || target == (void *)KeyStub ||
+        target == (void *)PosStub || !VirtualQuery(target, &mbi, sizeof(mbi)))
         return 0;
-    *outOrig = (void *)(uintptr_t)cur;
-    *(uint64_t *)(uintptr_t)slot = (uint64_t)(uintptr_t)stub;
-    VirtualProtect((void *)(uintptr_t)slot, 8, old, &old);
-    return 1;
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+        return 0;
+    access = mbi.Protect & 0xFF;
+    return access == PAGE_EXECUTE || access == PAGE_EXECUTE_READ ||
+           access == PAGE_EXECUTE_READWRITE || access == PAGE_EXECUTE_WRITECOPY;
 }
 
 static int Install(void) {
-    if (g_hooked) return 1;
-    if (!Redirect(IAT_ASYNCKEY, (void *)KeyStub,
-                  (void **)&g_realKey))
-        return 0;
-    if (!Redirect(IAT_CURSORPOS, (void *)PosStub,
-                  (void **)&g_realPos)) {
-        return 0;
+    void *volatile *key;
+    void *volatile *pos;
+    void *keyOrig, *posOrig;
+    DWORD keyProtect = 0, posProtect = 0, ignored;
+    int keyWritable = 0, posWritable = 0, ok = 0;
+
+    AcquireSRWLockExclusive(&g_installLock);
+    if (g_hooked) { ok = 1; goto done; }
+    key = (void *volatile *)(uintptr_t)IAT_ASYNCKEY;
+    pos = (void *volatile *)(uintptr_t)IAT_CURSORPOS;
+    if (key == pos || ((uintptr_t)key & 7) || ((uintptr_t)pos & 7) ||
+        !ShReadableAddr((uint64_t)(uintptr_t)key, sizeof(void *)) ||
+        !ShReadableAddr((uint64_t)(uintptr_t)pos, sizeof(void *))) goto done;
+    keyOrig = *key;
+    posOrig = *pos;
+    if (!ValidTarget(keyOrig) || !ValidTarget(posOrig)) goto done;
+    if ((g_realKey && (void *)g_realKey != keyOrig) ||
+        (g_realPos && (void *)g_realPos != posOrig)) goto done;
+
+    if (!VirtualProtect((void *)key, sizeof(void *), PAGE_READWRITE, &keyProtect))
+        goto done;
+    keyWritable = 1;
+    if (!VirtualProtect((void *)pos, sizeof(void *), PAGE_READWRITE, &posProtect))
+        goto restore;
+    posWritable = 1;
+    if (*key != keyOrig || *pos != posOrig) goto restore;
+
+    g_realKey = (AsyncKey_t)keyOrig;
+    g_realPos = (CursorPos_t)posOrig;
+    MemoryBarrier();
+    if (InterlockedCompareExchangePointer(key, (void *)KeyStub, keyOrig) != keyOrig)
+        goto restore;
+    if (InterlockedCompareExchangePointer(pos, (void *)PosStub, posOrig) != posOrig) {
+        InterlockedCompareExchangePointer(key, keyOrig, (void *)KeyStub);
+        goto restore;
     }
     g_hooked = 1;
-    return 1;
+    ok = 1;
+
+restore:
+    /* Reverse order preserves the original protection when slots share a page. */
+    if (posWritable && !VirtualProtect((void *)pos, sizeof(void *), posProtect, &ignored))
+        ok = 0;
+    if (keyWritable && !VirtualProtect((void *)key, sizeof(void *), keyProtect, &ignored))
+        ok = 0;
+done:
+    ReleaseSRWLockExclusive(&g_installLock);
+    return ok;
 }
 
 /** Which inputs the game is told it is not receiving. 0

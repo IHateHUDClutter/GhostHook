@@ -467,8 +467,22 @@ static int InstallHook(void) {
         0x41,0x5B, 0x41,0x5A, 0x41,0x59, 0x41,0x58, 0x5A, 0x59, 0x58
     };
 
+    static const uint8_t legacy[32] = {
+        0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x6C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x57,
+        0x48,0x83,0xEC,0x20,0x48,0x89,0xCF,0x4C,0x89,0xC6,0x8B,0x0D,0x64,0x52,0x44,0xEE
+    };
+    static const uint8_t tu25[32] = {
+        0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x6C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x57,
+        0x48,0x83,0xEC,0x20,0x48,0x89,0xCF,0x4C,0x89,0xC6,0x8B,0x0D,0x44,0xB0,0xA0,0xEE
+    };
+    const uint8_t *expected;
+
     if (g_stub) return 1;
-    if (!ShReadableAddr(fn, n)) return 0;
+    if (ShIsTU25Build()) expected = tu25;
+    else if (ShIsLegacyBuild()) expected = legacy;
+    else return 0;
+    if (!ShReadableAddr(fn, sizeof(legacy)) ||
+        memcmp((const void *)(uintptr_t)fn, expected, sizeof(legacy))) return 0;
 
     s = (uint8_t *)ShAllocNear(fn);
     if (!s) return 0;
@@ -644,57 +658,3 @@ SH_API int ShTeleportPlayerToGround(float x, float y,
     dest.z = z + clearance;
     return ShTeleportPlayer(&dest, NULL);
 }
-
-#if 0
-/* Two stage far teleport. Went to altitude to stream the
- * destination, then dropped. It left the player falling.
- */
-static int FarToGround(float x, float y, float clearance) {
-    ShVec3 dest, here;
-    float z = 0.0f;
-    int spins;
-
-    dest.x = x;
-    dest.y = y;
-
-    /* Too far to query, since nothing is streamed there.
-     * Go first at altitude, which streams it, then drop.
-     */
-    dest.z = 1600.0f;
-    if (ShGetPlayerPosition(&here) && here.z + 400.0f > dest.z)
-        dest.z = here.z + 400.0f;
-    if (!ShTeleportPlayer(&dest, NULL)) return 0;
-
-    /* A region still streaming in answers with a bogus
-     * high hit, so take it only once it stops moving.
-     */
-    {
-        float prev = 0.0f;
-        int agree = 0;
-
-        /* Wait until the player is there, a free read.
-         * Casting into a region still building kills it.
-         */
-        for (spins = 0; spins < 200; spins++) {
-            if (ShGetPlayerPosition(&here)
-                && fabsf(here.x - x) < 8.0f
-                && fabsf(here.y - y) < 8.0f)
-                break;
-            Sleep(10);
-        }
-        if (spins >= 200) return ShFailPhys(SH_ERR_NO_GROUND);
-
-        for (spins = 0; spins < 120; spins++) {
-            Sleep(50);
-            if (!ShGroundHeight(x, y, &z)) { agree = 0; continue; }
-            if (agree && fabsf(z - prev) < 0.5f) {
-                dest.z = z + clearance;
-                return ShTeleportPlayer(&dest, NULL);
-            }
-            prev = z;
-            agree = 1;
-        }
-    }
-    return ShFailPhys(SH_ERR_NO_GROUND);
-}
-#endif

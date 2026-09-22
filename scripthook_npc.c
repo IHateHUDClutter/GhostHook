@@ -31,7 +31,7 @@
 #define RVA_REGISTRY     0x4BC17F8
 #define RVA_ARCH_DESC    0x42C2560
 #define RVA_NULL_BLOCK   0x4D88FE8
-#define NPC_SPEC_VTABLE  SH_IMG(0x394A660)
+#define RVA_NPC_VTABLE   0x394A660
 
 #define COMMIT_MODE      7
 #define SPAWN_MODE       1
@@ -58,8 +58,33 @@ typedef uint64_t (__attribute__((ms_abi)) *PoolFind_t)(uint64_t,
                                                        uint64_t, int);
 
 static uint64_t ImgAddr(uint64_t rva) {
-    return (uint64_t)(uintptr_t)GetModuleHandleA(NULL) + rva;
+    if (ShIsTU25Build()) {
+        switch (rva) {
+        case RVA_MGR_GETTER:   rva = 0x990BAB0; break;
+        case RVA_SPAWN:        rva = 0x990B0B0; break;
+        case RVA_COMMIT:       rva = 0x990CA70; break;
+        case RVA_SET_CATEGORY: rva = 0xA9E51B0; break;
+        case RVA_SET_174:      rva = 0xA9E63B0; break;
+        case RVA_POP_REGISTER: rva = 0x8AE8EA0; break;
+        case RVA_COLLECT:      rva = 0xC1F5BA0; break;
+        case RVA_KIND:         rva = 0x89372E0; break;
+        case RVA_POOL_FIND:    rva = 0xE2E0780; break;
+        case RVA_SPEC_OF:      rva = 0xA9C3F80; break;
+        case RVA_RETIRE:       rva = 0x99FE180; break;
+        case RVA_POOL:         rva = 0x4D89080; break;
+        case RVA_POPMGR:       rva = 0x4B98FA8; break;
+        case RVA_CONTEXT:      rva = 0x4B90288; break;
+        case RVA_REGISTRY:     rva = 0x4BC1878; break;
+        case RVA_ARCH_DESC:    rva = 0x42C2570; break;
+        case RVA_NULL_BLOCK:   rva = 0x4D89068; break;
+        case RVA_NPC_VTABLE:   rva = 0x394A4E0; break;
+        default: break;
+        }
+    }
+    return ShImageBase() + rva;
 }
+
+#define NPC_SPEC_VTABLE ImgAddr(RVA_NPC_VTABLE)
 
 /* Handle block: object +0, refcount +8, flags +0xC (bit 31
  * valid), id +0x10. */

@@ -9,7 +9,7 @@ GhostHook does not relocate or centrally manage INI files. Most current plugins
 resolve them beside their own ASI, but individual plugins may use another path.
 
 `scripthook.h` is the authoritative public API. `SH_API_VERSION` remains 1.
-The current GhostHook DLL exports 240/240 public functions declared by the header.
+GhostHook exports the public functions declared by the current `scripthook.h`.
 
 ## Build and link
 

@@ -5,6 +5,7 @@
 #define GRW_SCRIPTHOOK_H
 
 #include <stdint.h>
+#include <windows.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -21,6 +22,28 @@ extern "C" {
 #else
 #define SH_API
 #endif
+
+/* Reforged FOV Changer compatibility. Only its two blocked modes are exposed. */
+enum ShCameraViewModeValue {
+    SH_VIEW_UNKNOWN = 0,
+    SH_VIEW_FIRST_PERSON = 1,
+    SH_VIEW_THIRD_PERSON = 2
+};
+#define SH_MODE_BLACKLIST_GHOST_WAR   0x01u
+#define SH_MODE_BLACKLIST_MERCENARIES 0x02u
+typedef void (*ShPluginBlockedFn)(int allowed, int blocked, void *user);
+SH_API int ShCameraViewMode(void);
+SH_API float ShFovEngine(void);
+SH_API void ShFovPin(int on);
+SH_API int ShPluginBlacklist(uint32_t modes);
+SH_API int ShPluginAllowed(void);
+SH_API int ShPluginOnBlocked(ShPluginBlockedFn fn, void *user);
+SH_API int ShFp2Install(void);
+SH_API int ShFp2Ready(void);
+SH_API void ShFp2Enable(int on);
+SH_API void ShFp2SetOffset(float right, float forward, float up);
+SH_API void ShFp2Gate(int *menu, int *drone, int *ads, int *fresh);
+SH_API void ShFp2HeadShow(int show);
 
 /** Metres. x east, y north, z up. */
 typedef struct { float x, y, z; } ShVec3;
@@ -76,6 +99,61 @@ SH_API int      ShInDrone(void);
 SH_API int      ShInLoadout(void);
 SH_API int      ShInMap(void);
 SH_API int      ShInBinocular(void);
+
+/** @} */
+/** @defgroup files File interception (OPEN and ATTR)
+ *  The callback and descriptor layouts match the pinned Reforged API. @{ */
+
+#define SH_FILE_HIDE     1
+#define SH_FILE_OPEN     0x0001u
+#define SH_FILE_ATTR     0x0002u
+
+typedef struct {
+    const char    *api;
+    uint32_t       group;
+    int            wide;
+    const wchar_t *path;
+    const char    *pathA;
+    const wchar_t *asked;
+    const char    *askedA;
+    const wchar_t *to;
+    const char    *toA;
+    DWORD          access;
+    DWORD          share;
+    DWORD          disp;
+    DWORD          flags;
+    HANDLE         handle;
+    void          *buffer;
+    DWORD          bytes;
+    DWORD          done;
+    void          *overlapped;
+    uint64_t       offset;
+    void          *result;
+    DWORD          error;
+    int            answered;
+    int            matched;
+    void          *user;
+} ShFileCall;
+
+typedef int  (*ShFileDecideFn)(ShFileCall *call, void *user);
+typedef void (*ShFileAfterFn)(ShFileCall *call, void *user);
+
+typedef struct {
+    const wchar_t  *name;
+    const wchar_t  *suffix;
+    uint32_t        group;
+    int             action;
+    const wchar_t  *to;
+    ShFileDecideFn  before;
+    ShFileAfterFn   after;
+    void           *user;
+} ShFileRuleDesc;
+
+typedef struct ShFileRule ShFileRule;
+
+SH_API ShFileRule *ShFileRuleAdd(const ShFileRuleDesc *desc);
+SH_API int ShFileRuleDel(ShFileRule *rule);
+SH_API uint32_t ShFileCallCount(void);
 
 /** @} */
 /** @addtogroup core
@@ -573,6 +651,10 @@ SH_API int  ShGetHeadNodes(uint64_t entity, uint64_t *out,
 typedef void (*ShMenuFn)(uint32_t menu, uint32_t item, int value,
                          void *user);
 
+typedef struct ShText { const char *id; const char *text; } ShText;
+SH_API int ShLangDeclare(const char *owner, const char *lang,
+                         const ShText *rows, int n);
+
 /** A top level entry for your plugin. F4 opens the root. */
 SH_API uint32_t ShMenuCreate(const char *title);
 SH_API uint32_t ShMenuSub(uint32_t parent, const char *label);
@@ -587,6 +669,7 @@ SH_API int  ShMenuNumber(uint32_t menu, const char *label,
 SH_API int  ShMenuList(uint32_t menu, const char *label,
                        const char **opts, int n, int initial,
                        ShMenuFn fn, void *user);
+SH_API int  ShMenuSetValue(uint32_t menu, const char *label, int value);
 /** Drop a menu's items, keeping the row, so a plugin can
  *  rebuild its own menu without stacking duplicates. */
 SH_API int  ShMenuClear(uint32_t menu);
@@ -594,9 +677,52 @@ SH_API int  ShMenuClear(uint32_t menu);
 SH_API int  ShMenuDestroy(uint32_t menu);
 /** The line under the items. Empty text removes it. */
 SH_API int  ShMenuStatus(uint32_t menu, const char *text);
+SH_API int  ShMenuStatusF(uint32_t menu, const char *fmt, ...);
+SH_API int  ShMenuHint(uint32_t menu, const char *text);
 SH_API void ShMenuSetKey(int vk);
 SH_API int  ShMenuIsOpen(void);
+SH_API int  ShMenuIsShowing(uint32_t menu);
 SH_API void ShMenuOpen(int open);
+
+/** @} */
+/** @defgroup reforged_framework Reforged framework compatibility
+ *  Additive configuration, paths and localization.
+ *  @{ */
+
+SH_API void ShConfigInit(void);
+SH_API int ShConfigGetInt(const char *section, const char *key, int def);
+SH_API int ShConfigGetBool(const char *section, const char *key, int def);
+SH_API int ShConfigGetStr(const char *section, const char *key,
+                          const char *def, char *out, int size);
+SH_API int ShConfigSetStr(const char *section, const char *key,
+                          const char *value);
+SH_API int ShConfigSetInt(const char *section, const char *key, int value);
+SH_API int ShConfigSetBool(const char *section, const char *key, int value);
+
+#define SH_LOG_NONE 0
+#define SH_LOG_ERR 1
+#define SH_LOG_WARN 2
+#define SH_LOG_INFO 3
+#define SH_LOG_DBG 4
+SH_API int ShLogLevel(void);
+SH_API int ShGameDir(char *buf, int size);
+SH_API int ShPluginsDir(char *buf, int size);
+SH_API int ShScriptsDir(char *buf, int size);
+SH_API int ShLogPath(const char *name, char *buf, int size);
+SH_API int ShPluginIniPath(const char *plugin, char *buf, int size);
+SH_API int ShPluginLangPath(const char *plugin, char *buf, int size);
+
+SH_API int ShLangBuiltin(int i, char *buf, int size);
+SH_API const char *ShLangLabel(const char *code);
+SH_API const char *ShLangText(const char *owner, const char *key);
+SH_API int ShLangHas(const char *owner, const char *key);
+SH_API const char *ShLang(const char *text);
+SH_API const char *ShLangFor(const char *scope, const char *text);
+SH_API const char *ShLangForOwned(const char *owner, const char *scope,
+                                  const char *text);
+SH_API int ShLangMatch(const char *a, const char *b);
+SH_API const char *ShLangGet(void);
+SH_API int ShLangPickLine(char *buf, int size);
 
 /** @} */
 /** @defgroup hud HUD

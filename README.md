@@ -31,13 +31,29 @@ consistent. The first launch after installing or updating GhostHook may take
 longer than normal for the menu to appear. Subsequent launches should
 initialize faster and more consistently.
 
-## Known compatibility issue
+## GhostHook Settings
 
-Immersive Healing is temporarily unavailable for the initial GhostHook TU25 beta while a reproducible runtime interaction is investigated.
+GhostHook includes a built-in GhostHook Settings submenu.
 
-The remaining current mod set completed a two-hour final stress run without
-reproducing the issue. This does not establish universal third-party plugin
-compatibility or exhaustive runtime testing of every API.
+Menu Scaling options:
+
+- Small — 0.85x
+- Default — 1.00x
+- Large — 1.25x
+- XLarge — 1.50x
+
+The selected menu scale is saved in `GhostHook.ini` beside `dinput8.dll` and
+restored automatically when the game is launched again.
+
+## Reforged Compatibility
+
+GhostHook includes compatibility support for several Reforged mods, including
+First Person, Skip Intro Videos, Vehicle Dispatch, and FOV Changer.
+
+## Menu Ordering
+
+Mod entries in the GhostHook menu are listed alphabetically. GhostHook Settings
+remains the final entry in the main menu.
 
 ## Documentation
 
@@ -58,7 +74,7 @@ the native UI: scenes, widgets, properties, input and reloads.
 | Vehicle spawning | 65 vehicles, catalogued and named by hand |
 | Entity enumeration | Kind, position, health, components |
 | Entity visibility | Hide or show anything, optionally held |
-| Teleport | Verified 9.9km cross map, lands within 3m |
+| Teleport | Cross-map player teleport support |
 | Health | Read and write through the game's obfuscated storage |
 | Ground queries | Uses the engine's own collision world |
 | Camera | Position, orientation, roll, fov, the view matrices |
@@ -145,7 +161,7 @@ because bullets usually strike a child part rather than the vehicle.
 
 GhostHook preserves the existing public ScriptHook API/ABI.
 `scripthook.h` is the authoritative public header. `SH_API_VERSION` remains 1,
-and the current GhostHook DLL exports all 240/240 declared public functions.
+and the current GhostHook DLL exports the functions declared by that header.
 Return values and error behavior are documented per function in that header.
 The import library is developer-facing; ordinary users do not need it.
 See the plugin guide for TU25 frame callbacks and their threading limits.
@@ -205,9 +221,8 @@ impact that stopped it. Flags are opt in:
 
 A projectile is stepped every frame and its hit list accumulates, so
 the API holds each bullet and reports its furthest hit once the
-projectile stops being stepped. That costs about 120ms of latency
-and is why acting on the first reported hit puts you on a fence post
-instead of the target.
+projectile stops being stepped. This introduces some reporting latency
+and avoids acting on an earlier intermediate hit.
 
 ### Threads
 
@@ -261,26 +276,13 @@ GhostHook is based on Phiality / PhialsBasement's
 [GRW ScriptHook](https://github.com/PhialsBasement/grw-scripthook).
 The upstream implementation and research form the basis of this fork.
 
-The camera work stands on **Firejumper93's**
-[GhostReconWildlandsVR](https://github.com/Firejumper93/GhostReconWildlandsVR),
-MIT licensed and unusually well documented. Its notes gave us the
-camera struct layout, the fact that `Camera+0x000` is the transform
-the view builder actually consumes rather than one of the derived
-matrices, and this engine's yaw and pitch convention. Their build log
-also records the write to `+0x4A0` that quietly does nothing, which
-is exactly the wrong turn we would have taken.
-
-The addresses here are our own, since this build is newer than any in
-their table, but the reverse engineering that made them meaningful is
-theirs.
+The camera implementation also draws on **Firejumper93's**
+[GhostReconWildlandsVR](https://github.com/Firejumper93/GhostReconWildlandsVR)
+research. GhostHook retains attribution for that contribution.
 
 Comparative work in [GameXueRen's GRW ScriptHook fork](https://github.com/GameXueRen/grw-scripthook)
-provided the lead for combined asset discovery, a `MEM_PRIVATE`-first scan,
-broad fallback, miss backoff, and earlier native-menu construction and batching
-concepts ([asset-scan commit](https://github.com/GameXueRen/grw-scripthook/commit/333ef39e2b51008fc04db89fac32b4b747ce6b67),
-[menu commit](https://github.com/GameXueRen/grw-scripthook/commit/42d3cf7485a734ae16abee1e5ac3f01c9001b823)).
-GhostHook independently integrated and adapted the relevant concepts; its
-own runtime testing established the production result.
+provided useful compatibility and implementation leads. GhostHook independently
+integrated and adapted the relevant concepts.
 
 ## Licence
 

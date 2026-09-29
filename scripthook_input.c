@@ -29,6 +29,17 @@ static volatile int g_haveFrozen = 0;
 static volatile uint8_t g_keyBlock[256];
 static volatile int g_anyKeyBlock = 0;
 
+/* Private Reforged compatibility: the plugin requires a foreground-game
+ * predicate before it polls any of its three physical toggle keys. */
+SH_API int ShGameFocused(void) {
+    HWND fg = GetForegroundWindow();
+    DWORD pid = 0;
+
+    if (!fg) return 0;
+    GetWindowThreadProcessId(fg, &pid);
+    return pid == GetCurrentProcessId() ? 1 : 0;
+}
+
 /* Never swallowed, so a player can always pause, alt tab
  * or reach the menu whatever a mod is doing.
  */

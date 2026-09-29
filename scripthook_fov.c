@@ -11,6 +11,7 @@
 #define SH_BUILD 1
 #include "scripthook.h"
 #include "image.h"
+#include "fp2_internal.h"
 
 /* mov [rax+0x180], ecx   rax is the camera manager. */
 #define FOV_SITE  SH_IMG(0x7E889A2)
@@ -25,12 +26,20 @@ extern void ShSetError(int err);
 extern void *ShAllocNear(uint64_t target);
 extern int ShReadableAddr(uint64_t addr, size_t len);
 
-/* Read by the stub: enabled, then the value as bits. */
-static volatile uint32_t g_state[2] = { 0, 0 };
+/* Existing override, plus the unmodified engine value and No Zoom pin. */
+static volatile uint32_t g_state[4] = { 0, 0, 0, 0 };
 
 static uint8_t *g_stub = NULL;
 static uint8_t  g_orig[FOV_LEN];
 static int      g_hooked = 0;
+
+void ShFp2FovStateSnapshot(uint32_t out[5]) {
+    out[0] = g_state[0];
+    out[1] = g_state[1];
+    out[2] = g_state[2];
+    out[3] = g_state[3];
+    out[4] = g_hooked;
+}
 
 static int BuildStub(void) {
     uint8_t *s = (uint8_t *)ShAllocNear(FOV_SITE);
@@ -44,9 +53,15 @@ static int BuildStub(void) {
     s[o++] = 0x49; s[o++] = 0xBA;                  /* mov r10,im */
     *(uint64_t *)(s + o) = (uint64_t)(uintptr_t)g_state;
     o += 8;
+    s[o++] = 0x41; s[o++] = 0x89; s[o++] = 0x4A;   /* mov [r10+8],ecx */
+    s[o++] = 0x08;
     s[o++] = 0x41; s[o++] = 0x83; s[o++] = 0x3A;   /* cmp [r10],0 */
     s[o++] = 0x00;
-    s[o++] = 0x74; s[o++] = 0x0C;                  /* je +12     */
+    s[o++] = 0x74; s[o++] = 0x13;                  /* je +19     */
+
+    s[o++] = 0x41; s[o++] = 0x83; s[o++] = 0x7A;   /* cmp [r10+C],0 */
+    s[o++] = 0x0C; s[o++] = 0x00;
+    s[o++] = 0x75; s[o++] = 0x08;                  /* pinned: skip pass gate */
 
     /* Positive floats order like unsigned ints, so one cmp
      * passes a zooming engine value through untouched.
@@ -133,6 +148,43 @@ int ShFovSet(float radians) {
 
 void ShFovClear(void) {
     g_state[0] = 0;
+    g_state[3] = 0;
+}
+
+SH_API void ShFovPin(int on) {
+    Fp2TraceToken diag = ShFp2TraceEnter("ShFovPin",
+        __builtin_return_address(0), "on=%d", on);
+    g_state[3] = on ? 1u : 0u;
+    ShFp2TraceExit(diag, "void pin=%u", g_state[3]);
+}
+
+SH_API float ShFovEngine(void) {
+    Fp2TraceToken diag = ShFp2TraceEnter("ShFovEngine",
+        __builtin_return_address(0), "-");
+    uint32_t bits;
+    float f;
+    if (!Install()) {
+        ShFp2TraceExit(diag, "float=0 install=failed");
+        return 0.0f;
+    }
+    bits = g_state[2];
+    memcpy(&f, &bits, sizeof(f));
+    ShFp2TraceExit(diag, "float=%.6g install=ready", f);
+    return f;
+}
+
+/* FP2's camera callback only needs the last engine value. Hook
+ * installation remains on the plugin thread via ShFovEngine. */
+float ShFovPeekEngine(void) {
+    uint32_t bits = g_state[2];
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+/* Observe the engine value for optic camera handover; no override or pin. */
+int ShFovObserveEngine(void) {
+    return Install();
 }
 
 int ShFovActive(void) {

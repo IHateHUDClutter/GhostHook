@@ -5,10 +5,12 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <stdio.h>
 
 #define SH_BUILD 1
 #include "scripthook.h"
 #include "image.h"
+#include "fp2_internal.h"
 
 /* RVAs, so this survives a relocated image. */
 #define RVA_PLAYER_MGR   0x4BB6438
@@ -29,9 +31,12 @@ extern int ShReadableAddr(uint64_t addr, size_t len);
 extern int ShReadMem(uint64_t addr, void *out, size_t len);
 extern uint64_t ShReadQ(uint64_t addr);
 extern void ShSetError(int err);
+extern int ShPeekPlayer(ShPlayer *out);
+extern int ShStateReadOnly(void);
 extern int ShRequireInGame(void);
 extern int ShGetHealthEntity(uint64_t entity, uint32_t *cur,
                              uint32_t *max);
+extern int ShFp2HeadRehideActive(void);
 
 static uint64_t ImgAddr(uint64_t rva) {
     return SH_IMG(rva);
@@ -265,6 +270,17 @@ static int SetNodesHidden(uint64_t entity, int hidden, int *seen) {
 
 static uint64_t g_headEnt = 0;
 static uint64_t g_headCtrl = 0;
+static volatile LONG g_censusActive;
+static DWORD g_censusThread;
+static struct {
+    uint64_t entity, controller, array, heads[64], signatures[64];
+    int count;
+} g_directGround;
+static struct {
+    uint64_t arg, a2, transform, entity;
+} g_directCapture;
+static volatile LONG g_directReady, g_captureReady, g_directDone;
+static void ShFp2MaybeDirectCensus(void);
 
 /* Both arrays land in two kernel reads and compare
  * locally. A syscall per element multiplied out to tens
@@ -302,20 +318,134 @@ static int CtrlAlive(uint64_t ctrl, uint64_t entity) {
     return OwnsAnyNode(ctrl, entity);
 }
 
-static uint64_t FindHeadGroup(uint64_t entity) {
+static int SixHeadNodesValidated(uint64_t controller, uint64_t entity,
+                           int *headCount);
+
+/* The pinned Reforged chain is bounded to nine pointer reads and one tag.
+ * It is a candidate source only; current-player and six-node checks follow. */
+static uint64_t BoundedHeadCandidate(const char **reason) {
+    uint64_t a, c, candidate;
+    uint16_t tag;
+    a = ShReadQ(SH_IMG(0x4B90638));
+    if (!a) goto incomplete;
+    a = ShReadQ(a + 0x10); if (!a) goto incomplete;
+    a = ShReadQ(a + 0x10); if (!a) goto incomplete;
+    a = ShReadQ(a); if (!a) goto incomplete;
+    a = ShReadQ(a + 0x78); if (!a) goto incomplete;
+    c = ShReadQ(a + 0x10); if (!c) goto incomplete;
+    c = ShReadQ(c + 0x10); if (!c) goto incomplete;
+    if (!ShReadMem(c + 3, &tag, sizeof(tag))) goto incomplete;
+    tag &= 0xffu;
+    if (tag > 0x20u) {
+        *reason = "tag_out_of_bounds";
+        return 0;
+    }
+    a = ShReadQ(a + 0x27); if (!a) goto incomplete;
+    candidate = ShReadQ(a + (uint64_t)tag * 8u);
+    if (!candidate) goto incomplete;
+    *reason = "complete";
+    return candidate;
+incomplete:
+    *reason = "incomplete_chain";
+    return 0;
+}
+
+static int Fp2ControllerValid(uint64_t ctrl, uint64_t entity,
+                              int *headCount, int *validated) {
+    *headCount = *validated = 0;
+    if (!ctrl || !ShReadableAddr(ctrl, 0x70) ||
+        ShReadQ(ctrl) != CTRL_VT ||
+        ShReadQ(ctrl + 0x28) != entity ||
+        !CtrlAlive(ctrl, entity)) return 0;
+    *validated = SixHeadNodesValidated(ctrl, entity, headCount);
+    return *headCount == 6 && *validated == 6;
+}
+
+static uint64_t FindHeadGroup(uint64_t entity, int allowSweep) {
     MEMORY_BASIC_INFORMATION mbi;
     uint8_t *scan = (uint8_t *)0x10000;
+    Fp2ScanMetrics metrics = {0};
+    Fp2TraceToken scanLog = {0};
+    uint64_t candidate = ShFp2NativeHeadCandidate();
+    Fp2TraceToken resolveLog = ShFp2TraceHeadResolveBegin(
+        entity, g_headCtrl, candidate);
+    Fp2TraceToken fallbackLog;
+    LARGE_INTEGER candidateStart;
+    int candidateAlive, headCount = 0, validated = 0;
+    const char *chainReason = "not_attempted";
+    uint64_t chainCandidate;
+    int census = g_censusActive &&
+                 g_censusThread == GetCurrentThreadId();
 
     /* These are freed and recycled, so a cached pointer is
      * verified before it is trusted.
      */
-    if (g_headEnt == entity && CtrlAlive(g_headCtrl, entity))
+    if (g_headEnt == entity &&
+        (allowSweep ? CtrlAlive(g_headCtrl, entity) :
+         Fp2ControllerValid(g_headCtrl, entity, &headCount,
+                            &validated))) {
+        if (census)
+            ShFp2TraceCensusEvent("SCAN_CACHE_HIT controller=0x%llX entity=0x%llX",
+                (unsigned long long)g_headCtrl,
+                (unsigned long long)entity);
+        ShFp2TraceHeadResolveEnd(resolveLog, "existing_cache", g_headCtrl);
         return g_headCtrl;
+    }
     g_headEnt = 0;
     g_headCtrl = 0;
+    if (candidate) {
+        QueryPerformanceCounter(&candidateStart);
+        candidateAlive = allowSweep ? CtrlAlive(candidate, entity) :
+            Fp2ControllerValid(candidate, entity, &headCount,
+                               &validated);
+        ShFp2TraceHeadResolveCandidate(resolveLog, candidate,
+                                      candidateAlive, candidateStart.QuadPart);
+        if (candidateAlive) {
+            g_headEnt = entity;
+            g_headCtrl = candidate;
+            ShFp2TraceHeadResolveEnd(resolveLog, "ads_candidate", candidate);
+            return candidate;
+        }
+    } else {
+        ShFp2TraceHeadResolveCandidate(resolveLog, 0, 0, 0);
+    }
+    if (!allowSweep) {
+        LARGE_INTEGER start, end, frequency;
+        QueryPerformanceCounter(&start);
+        chainCandidate = BoundedHeadCandidate(&chainReason);
+        candidateAlive = Fp2ControllerValid(chainCandidate, entity,
+                                             &headCount, &validated);
+        QueryPerformanceCounter(&end);
+        if (!QueryPerformanceFrequency(&frequency)) frequency.QuadPart = 0;
+        ShFp2TraceStateEvent(FFP_STATE_RESOLVE,
+            "player=0x%llX source=bounded_chain candidate=0x%llX "
+            "chain=%s current_owner=%d CtrlAlive=%d head_count=%d "
+            "validated=%d accepted=%d elapsed_ms=%.3f "
+            "global_sweep_entered=0",
+            (unsigned long long)entity,
+            (unsigned long long)chainCandidate, chainReason,
+            chainCandidate && ShReadQ(chainCandidate + 0x28) == entity,
+            chainCandidate && CtrlAlive(chainCandidate, entity),
+            headCount, validated, candidateAlive,
+            frequency.QuadPart ?
+                (double)(end.QuadPart - start.QuadPart) * 1000.0 /
+                (double)frequency.QuadPart : 0.0);
+        if (candidateAlive) {
+            g_headEnt = entity;
+            g_headCtrl = chainCandidate;
+            ShFp2TraceHeadResolveEnd(resolveLog, "bounded_chain",
+                                        chainCandidate);
+            return chainCandidate;
+        }
+        ShFp2TraceHeadResolveEnd(resolveLog, "no_candidate_no_sweep", 0);
+        return 0;
+    }
+    fallbackLog = ShFp2TraceFallbackBegin(resolveLog);
+    if (census) scanLog = ShFp2TraceScanBegin();
 
     while (VirtualQuery(scan, &mbi, sizeof(mbi))) {
         uint8_t *next = (uint8_t *)mbi.BaseAddress + mbi.RegionSize;
+        if (census) ++metrics.regions;
         if (next <= scan) break;
         if ((uint64_t)(uintptr_t)mbi.BaseAddress >= 0x800000000000ULL)
             break;
@@ -329,30 +459,67 @@ static uint64_t FindHeadGroup(uint64_t entity) {
              * mid scan skips instead of faulting. Chunks
              * overlap so no candidate spans a seam. */
             static uint8_t buf[0x10000];
+            if (census) ++metrics.rwRegions;
 
             for (o = 0; o + 0x50 <= sz;
-                 o += sizeof(buf) - 0x50) {
+                  o += sizeof(buf) - 0x50) {
                 got = sz - o;
                 if (got > sizeof(buf)) got = sizeof(buf);
+                if (census) metrics.bytesPresented += got;
                 if (!ShReadMem((uint64_t)(uintptr_t)(b + o),
-                               buf, got))
+                               buf, got)) {
+                    if (census) ++metrics.failedChunks;
                     continue;
+                }
+                if (census) ++metrics.readChunks;
                 for (k = 0; k + 0x50 <= got; k += 8) {
                     uint64_t vt;
                     memcpy(&vt, buf + k, 8);
                     if (vt != CTRL_VT) continue;
+                    if (census) {
+                        ++metrics.vtHits;
+                        ++metrics.ownershipCalls;
+                    }
                     if (!OwnsAnyNode(
                             (uint64_t)(uintptr_t)(b + o + k),
                             entity))
                         continue;
                     g_headEnt = entity;
                     g_headCtrl = (uint64_t)(uintptr_t)(b + o + k);
+                    if (census) {
+                        uint64_t arr = ShReadQ(g_headCtrl + CTRL_NODES);
+                        uint16_t count = 0;
+                        int countOk = ShReadMem(g_headCtrl + CTRL_COUNT,
+                                                &count, 2);
+                        ShFp2TraceScanEnd(scanLog, &metrics, g_headCtrl);
+                        ShFp2TraceCensusEvent(
+                            "CTRL_FOUND controller=0x%llX vtable=0x%llX "
+                            "ctrl_nodes=0x%llX ctrl_count=%s%u entity=0x%llX "
+                            "BaseAddress=0x%llX AllocationBase=0x%llX "
+                            "RegionSize=0x%llX State=0x%lX Protect=0x%lX Type=0x%lX",
+                            (unsigned long long)g_headCtrl,
+                            (unsigned long long)vt,
+                            (unsigned long long)arr,
+                            countOk ? "" : "unavailable:", (unsigned)count,
+                            (unsigned long long)entity,
+                            (unsigned long long)(uintptr_t)mbi.BaseAddress,
+                            (unsigned long long)(uintptr_t)mbi.AllocationBase,
+                            (unsigned long long)mbi.RegionSize,
+                            (unsigned long)mbi.State,
+                            (unsigned long)mbi.Protect,
+                            (unsigned long)mbi.Type);
+                    }
+                    ShFp2TraceFallbackEnd(fallbackLog);
+                    ShFp2TraceHeadResolveEnd(resolveLog, "global_scan", g_headCtrl);
                     return g_headCtrl;
                 }
             }
         }
         scan = next;
     }
+    if (census) ShFp2TraceScanEnd(scanLog, &metrics, 0);
+    ShFp2TraceFallbackEnd(fallbackLog);
+    ShFp2TraceHeadResolveEnd(resolveLog, "failure", 0);
     return 0;
 }
 
@@ -389,6 +556,22 @@ static uint64_t g_visEnt[VIS_HELD];
 static uint64_t g_visNode[VIS_HELD];
 static uint64_t g_visSig[VIS_HELD];
 static int      g_visWant[VIS_HELD];
+static uint8_t  g_visFp2[VIS_HELD];
+static SRWLOCK  g_fp2CleanupLock = SRWLOCK_INIT;
+#define FP2_SAVED_HEADS 6
+static struct {
+    uint64_t entity;
+    uint64_t node[FP2_SAVED_HEADS];
+    uint64_t identity[FP2_SAVED_HEADS];
+    volatile LONG count;
+} g_fp2Saved;
+static volatile LONG g_fp2AdsRehideEvent;
+int ShFp2HeadOwned(void);
+
+void ShFp2HeadRehideRequest(int site) {
+    if (site != 0 && site != 1) return;
+    InterlockedExchange(&g_fp2AdsRehideEvent, site + 1);
+}
 
 /* Freed node memory stays readable, so a hold rewriting it
  * corrupts whatever lives there next. The vtable qword is
@@ -398,7 +581,8 @@ static void HoldVisibility(uint64_t entity, uint64_t node,
     int i, free = -1;
 
     for (i = 0; i < VIS_HELD; i++) {
-        if (g_visEnt[i] == entity && g_visNode[i] == node) {
+        if (!g_visFp2[i] && g_visEnt[i] == entity &&
+            g_visNode[i] == node) {
             g_visWant[i] = visible;
             return;
         }
@@ -417,7 +601,7 @@ static void ReleaseVisibility(uint64_t entity, uint64_t node) {
     int i;
 
     for (i = 0; i < VIS_HELD; i++) {
-        if (g_visEnt[i] != entity) continue;
+        if (g_visFp2[i] || g_visEnt[i] != entity) continue;
         if (node && g_visNode[i] != node) continue;
         g_visEnt[i] = 0;
         g_visNode[i] = 0;
@@ -434,19 +618,943 @@ static uint64_t g_onceEnt[VIS_ONCE];
 static uint64_t g_onceNode[VIS_ONCE];
 static uint64_t g_onceSig[VIS_ONCE];
 static int      g_onceWant[VIS_ONCE];
+static uint8_t  g_onceFp2[VIS_ONCE];
 
-static void QueueVisibility(uint64_t entity, uint64_t node,
-                            int visible) {
+static int QueueVisibilityOwned(uint64_t entity, uint64_t node,
+                                 int visible, int fp2,
+                                 uint64_t expectedSig) {
     int i;
 
     for (i = 0; i < VIS_ONCE; i++) {
         if (g_onceEnt[i]) continue;
         g_onceNode[i] = node;
-        g_onceSig[i] = node ? ShReadQ(node) : 0;
+        g_onceSig[i] = expectedSig ? expectedSig :
+                       (node ? ShReadQ(node) : 0);
         g_onceWant[i] = visible;
+        g_onceFp2[i] = fp2;
         g_onceEnt[i] = entity;
+        return 1;
+    }
+    return 0;
+}
+
+static void QueueVisibility(uint64_t entity, uint64_t node,
+                            int visible) {
+    QueueVisibilityOwned(entity, node, visible, 0, 0);
+}
+
+static int CurrentPlayerHasNode(uint64_t entity, uint64_t node) {
+    ShPlayer player;
+    uint64_t members[512];
+    int i, n;
+    if (ShStateReadOnly() != SH_STATE_INGAME ||
+        !ShPeekPlayer(&player) || player.entity != entity)
+        return 0;
+    n = ShGetEntityNodes(entity, members, 512);
+    for (i = 0; i < n; ++i)
+        if (members[i] == node) return 1;
+    return 0;
+}
+
+/* FP2 cleanup may be requested by the plugin thread. Only the pump
+ * performs the actual node flag write on the game thread. */
+static int ReleaseFp2Holds(int show, const char *reason) {
+    int i, owned = 0, released = 0, queuedCount = 0, staleCount = 0;
+    int remaining = 0;
+    AcquireSRWLockExclusive(&g_fp2CleanupLock);
+    for (i = 0; i < VIS_HELD; ++i)
+        if (g_visFp2[i]) ++owned;
+    if (!owned) {
+        ReleaseSRWLockExclusive(&g_fp2CleanupLock);
+        return 0;
+    }
+    if (reason)
+        ShFp2TraceDisableEvent(FFP_DISABLE_ENTRY,
+            "reason=%s owned_count=%d", reason, owned);
+    for (i = 0; i < VIS_HELD; ++i) {
+        uint64_t entity, node, sig;
+        int valid, queued = 0;
+        if (!g_visFp2[i]) continue;
+        entity = g_visEnt[i];
+        node = g_visNode[i];
+        sig = g_visSig[i];
+        valid = show && node && sig && ShReadQ(node) == sig;
+        if (show && valid)
+            queued = QueueVisibilityOwned(entity, node, 1, 1, sig);
+        queuedCount += queued;
+        if (show && !valid) ++staleCount;
+        g_visEnt[i] = g_visNode[i] = g_visSig[i] = 0;
+        g_visWant[i] = 0;
+        g_visFp2[i] = 0;
+        ++released;
+        if (reason)
+            ShFp2TraceDisableEvent(FFP_DISABLE_RELEASE,
+                "node=0x%llX saved_identity=0x%llX identity_valid=%d "
+                "hold_removed=1 show_queued=%d stale_cleanup=%d",
+                (unsigned long long)node, (unsigned long long)sig,
+                valid, queued, show && !valid);
+    }
+    for (i = 0; i < VIS_HELD; ++i)
+        if (g_visFp2[i]) ++remaining;
+    if (reason)
+        ShFp2TraceDisableEvent(FFP_DISABLE_EXIT,
+            "released_count=%d queued_count=%d stale_count=%d "
+            "remaining_owned_count=%d", released, queuedCount,
+            staleCount, remaining);
+    ReleaseSRWLockExclusive(&g_fp2CleanupLock);
+    return released;
+}
+
+void ShFp2HeadRelease(int show) {
+    (void)ReleaseFp2Holds(show, NULL);
+}
+
+static int ReleaseSavedHeldNode(uint64_t entity, uint64_t node) {
+    int i, found = 0;
+    if (!entity || !node) return 0;
+    for (i = 0; i < VIS_HELD; ++i) {
+        if (g_visEnt[i] != entity || g_visNode[i] != node) continue;
+        g_visEnt[i] = g_visNode[i] = g_visSig[i] = 0;
+        g_visWant[i] = 0;
+        g_visFp2[i] = 0;
+        ++found;
+    }
+    return found;
+}
+
+__attribute__((noinline)) int ShFp2HeadCleanup(const char *reason) {
+    int i, count, released = 0, queuedCount = 0, staleCount = 0;
+    int showVisible = !ShFp2AdsActive();
+    uint64_t entity;
+    ShFp2TraceCleanupEvent(FFP_CLEANUP_ENTRY,
+        "reason=%s saved_entity=0x%llX saved_count=%ld",
+        reason, (unsigned long long)g_fp2Saved.entity,
+        (long)InterlockedCompareExchange(&g_fp2Saved.count, 0, 0));
+    AcquireSRWLockExclusive(&g_fp2CleanupLock);
+    count = (int)g_fp2Saved.count;
+    entity = g_fp2Saved.entity;
+    if (count > FP2_SAVED_HEADS) count = FP2_SAVED_HEADS;
+    for (i = 0; i < count; ++i) {
+        uint64_t node = g_fp2Saved.node[i];
+        uint64_t saved = g_fp2Saved.identity[i];
+        uint64_t current = node ? ShReadQ(node) : 0;
+        int valid = node && saved && current == saved;
+        int found = ReleaseSavedHeldNode(entity, node);
+        int queued = valid && showVisible ?
+            QueueVisibilityOwned(entity, node, 1, 1, saved) : 0;
+        released += found;
+        queuedCount += queued;
+        if (!valid) ++staleCount;
+        ShFp2TraceCleanupEvent(FFP_CLEANUP_NODE,
+            "index=%d node=0x%llX saved_identity=0x%llX "
+            "current_identity=0x%llX identity_valid=%d "
+            "held_slot_found=%d hold_released=%d show_queued=%d",
+            i, (unsigned long long)node,
+            (unsigned long long)saved, (unsigned long long)current,
+            valid, found > 0, found > 0, queued);
+        g_fp2Saved.node[i] = g_fp2Saved.identity[i] = 0;
+    }
+    g_fp2Saved.entity = 0;
+    InterlockedExchange(&g_fp2Saved.count, 0);
+    ShFp2TraceCleanupEvent(FFP_CLEANUP_EXIT,
+        "released=%d queued=%d stale=%d saved_count_after=%ld",
+        released, queuedCount, staleCount, (long)g_fp2Saved.count);
+    ShFp2TraceStateEvent(FFP_STATE_RELEASE,
+        "reason=%s player=0x%llX fpp_active=%d ads_active=%d "
+        "released=%d show_queued=%d stale=%d saved_after=0 "
+        "global_sweep_entered=0",
+        reason, (unsigned long long)entity, ShFp2HeadRehideActive(),
+        !showVisible, released, queuedCount, staleCount);
+    ReleaseSRWLockExclusive(&g_fp2CleanupLock);
+    return released;
+}
+
+static int GetHeadNodesInternal(uint64_t entity, uint64_t *out,
+                                int max, int allowSweep);
+
+/* Native ADS provides an independent controller observation.
+ * This auxiliary capture is not published to the gameplay resolver. */
+#define ADS_TRACE_CAPTURE_MAX 8
+#define ADS_TRACE_EVENT_MAX 32
+typedef struct {
+    uint64_t player, candidate, owner;
+    uint16_t tag, nodeCount;
+    LONG epoch;
+    int complete, tagRead, readable, vtableMatch, ctrlAlive;
+} AdsTraceChainCapture;
+
+static AdsTraceChainCapture g_adsTraceChain;
+static volatile LONG g_adsTraceEpoch, g_adsTraceCaptureCount;
+static volatile LONG g_adsTraceLastSite = -1;
+static struct {
+    volatile LONG ready;
+    LONG epoch;
+    int site;
+    DWORD threadId;
+    uint64_t controller;
+} g_adsTraceAds[ADS_TRACE_EVENT_MAX];
+static volatile LONG g_adsTraceAdsWrite;
+static LONG g_adsTraceAdsRead;
+static uint64_t g_adsTraceLastAdsController, g_adsTraceLastAdsPlayer;
+static LONG g_adsTraceCompareSequence;
+
+static uint64_t ImmediateProbeRead(int step, uint64_t address) {
+    uint64_t value = ShReadQ(address);
+    ShFp2TraceAdsEvent(FFP_ADS_TRACE_CHAIN_STEP,
+        "step=%d address=0x%llX value=0x%llX",
+        step, (unsigned long long)address,
+        (unsigned long long)value);
+    return value;
+}
+
+static void ProbeReforgedHeadRoot(uint64_t entity) {
+    uint64_t root = SH_IMG(0x4B90638), a, c, node = 0;
+    AdsTraceChainCapture capture = {0};
+    uint16_t tag = 0;
+    int step = 0;
+    LONG epoch;
+    if (!ShFp2TraceAdsWanted()) return;
+    InterlockedExchange(&g_adsTraceEpoch, 0);
+    epoch = InterlockedIncrement(&g_adsTraceCaptureCount);
+    if (epoch > ADS_TRACE_CAPTURE_MAX) return;
+    capture.player = entity;
+    capture.epoch = epoch;
+    ShFp2TraceAdsEvent(FFP_ADS_TRACE_CHAIN_STEP,
+        "source=pinned_reforged_legacy_head_root "
+        "epoch=%ld slot=0x%llX read_only=1",
+        (long)epoch, (unsigned long long)root);
+    a = ImmediateProbeRead(step++, root); if (!a) goto done;
+    a = ImmediateProbeRead(step++, a + 0x10); if (!a) goto done;
+    a = ImmediateProbeRead(step++, a + 0x10); if (!a) goto done;
+    a = ImmediateProbeRead(step++, a); if (!a) goto done;
+    a = ImmediateProbeRead(step++, a + 0x78); if (!a) goto done;
+    c = ImmediateProbeRead(step++, a + 0x10); if (!c) goto done;
+    c = ImmediateProbeRead(step++, c + 0x10); if (!c) goto done;
+    if (!ShReadMem(c + 3, &tag, sizeof(tag))) goto done;
+    capture.tagRead = 1;
+    tag &= 0xFFu;
+    capture.tag = tag;
+    ShFp2TraceAdsEvent(FFP_ADS_TRACE_CHAIN_STEP,
+        "step=tag address=0x%llX value=0x%X valid=%d",
+        (unsigned long long)(c + 3), tag, tag <= 0x20u);
+    if (tag > 0x20u) goto done;
+    a = ImmediateProbeRead(step++, a + 0x27); if (!a) goto done;
+    node = ImmediateProbeRead(step++, a + (uint64_t)tag * 8u);
+    if (!node) goto done;
+    capture.complete = 1;
+    capture.candidate = node;
+    capture.readable = ShReadableAddr(node, 0x70);
+    if (capture.readable) {
+        capture.vtableMatch = ShReadQ(node) == CTRL_VT;
+        capture.owner = ShReadQ(node + 0x28);
+        ShReadMem(node + CTRL_COUNT, &capture.nodeCount,
+                  sizeof(capture.nodeCount));
+        capture.ctrlAlive = CtrlAlive(node, entity);
+    }
+done:
+    g_adsTraceChain = capture;
+    InterlockedExchange(&g_adsTraceLastSite, -1);
+    InterlockedExchange(&g_adsTraceEpoch, epoch);
+    ShFp2TraceAdsEvent(FFP_ADS_TRACE_CHAIN_CAPTURE,
+        "epoch=%ld player=0x%llX candidate=0x%llX "
+        "chain_complete=%d stop_after_step=%d tag_read=%d tag=0x%X "
+        "tag_valid=%d readable=%d vtable_match=%d "
+        "controller_player=0x%llX player_match=%d "
+        "controller_node_count=%u ctrl_alive=%d trusted=0",
+        (long)epoch, (unsigned long long)capture.player,
+        (unsigned long long)capture.candidate, capture.complete,
+        step - 1, capture.tagRead, capture.tag, capture.tagRead &&
+        capture.tag <= 0x20u, capture.readable,
+        capture.vtableMatch, (unsigned long long)capture.owner,
+        capture.owner == entity, (unsigned)capture.nodeCount,
+        capture.ctrlAlive);
+}
+
+/* The ADS bridge only publishes a site and RCX. All player/controller
+ * inspection and file logging run later in the existing game-thread pump. */
+void ShFp2AdsTracePublish(int site, uint64_t controller) {
+    LONG epoch, index;
+    if ((site != 0 && site != 1) || !ShFp2TraceAdsWanted()) return;
+    epoch = InterlockedCompareExchange(&g_adsTraceEpoch, 0, 0);
+    if (!epoch || InterlockedExchange(&g_adsTraceLastSite, site) == site)
+        return;
+    index = InterlockedIncrement(&g_adsTraceAdsWrite) - 1;
+    if (index >= ADS_TRACE_EVENT_MAX) return;
+    g_adsTraceAds[index].epoch = epoch;
+    g_adsTraceAds[index].site = site;
+    g_adsTraceAds[index].threadId = GetCurrentThreadId();
+    g_adsTraceAds[index].controller = controller;
+    InterlockedExchange(&g_adsTraceAds[index].ready, 1);
+}
+
+static int SixHeadNodesValidated(uint64_t controller, uint64_t entity,
+                           int *headCount) {
+    uint64_t array, heads[6], members[512];
+    uint16_t count = 0;
+    int i, j, memberCount, validated = 0;
+    *headCount = 0;
+    if (!controller || !entity ||
+        !ShReadMem(controller + CTRL_COUNT, &count, sizeof(count)))
+        return 0;
+    *headCount = count;
+    if (count != 6) return 0;
+    array = ShReadQ(controller + CTRL_NODES);
+    if (!array || !ShReadMem(array, heads, sizeof(heads))) return 0;
+    memberCount = ShGetEntityNodes(entity, members, 512);
+    if (memberCount <= 0) return 0;
+    for (i = 0; i < 6; ++i) {
+        if (!heads[i] || !ShReadQ(heads[i])) break;
+        for (j = 0; j < memberCount && members[j] != heads[i]; ++j) {}
+        if (j == memberCount) break;
+        for (j = 0; j < i && heads[j] != heads[i]; ++j) {}
+        if (j != i) break;
+        ++validated;
+    }
+    return validated;
+}
+
+static void ProcessAdsTraceComparisons(void) {
+    LONG available = InterlockedCompareExchange(&g_adsTraceAdsWrite, 0, 0);
+    if (available > ADS_TRACE_EVENT_MAX) available = ADS_TRACE_EVENT_MAX;
+    while (g_adsTraceAdsRead < available &&
+           InterlockedCompareExchange(&g_adsTraceAds[g_adsTraceAdsRead].ready,
+                                      0, 0)) {
+        LONG index = g_adsTraceAdsRead++;
+        LONG epoch = g_adsTraceAds[index].epoch;
+        uint64_t ads = g_adsTraceAds[index].controller;
+        uint64_t player = 0, owner = ads ? ShReadQ(ads + 0x28) : 0;
+        uint64_t candidate = g_adsTraceChain.candidate;
+        uint64_t candidateVtable = candidate ? ShReadQ(candidate) : 0;
+        uint64_t candidateOwner = candidate ?
+                                  ShReadQ(candidate + 0x28) : 0;
+        uint64_t previousController = g_adsTraceLastAdsController;
+        uint64_t previousPlayer = g_adsTraceLastAdsPlayer;
+        ShPlayer current;
+        uint16_t candidateNodeCount = 0;
+        int candidateReadable = candidate &&
+                                ShReadableAddr(candidate, 0x70);
+        int currentOk = ShPeekPlayer(&current) && current.entity;
+        int sameEpoch = epoch == g_adsTraceChain.epoch &&
+                        epoch == InterlockedCompareExchange(&g_adsTraceEpoch, 0, 0);
+        int playerMatch, exact, candidateAlive, adsAlive;
+        int headCount = 0, validated = 0, qualified;
+        const char *result;
+        if (currentOk) player = current.entity;
+        if (candidateReadable)
+            ShReadMem(candidate + CTRL_COUNT, &candidateNodeCount,
+                      sizeof(candidateNodeCount));
+        playerMatch = sameEpoch && player &&
+                      player == g_adsTraceChain.player && owner == player;
+        exact = sameEpoch && g_adsTraceChain.candidate &&
+                g_adsTraceChain.candidate == ads;
+        candidateAlive = sameEpoch && player &&
+                         g_adsTraceChain.candidate ?
+                         CtrlAlive(g_adsTraceChain.candidate, player) : 0;
+        adsAlive = player ? CtrlAlive(ads, player) : 0;
+        if (adsAlive)
+            validated = SixHeadNodesValidated(ads, player, &headCount);
+        qualified = sameEpoch && g_adsTraceChain.complete &&
+                    playerMatch && exact && candidateAlive &&
+                    adsAlive && headCount == 6 && validated == 6;
+        if (!sameEpoch) result = "stale_capture_epoch";
+        else if (!playerMatch) result = "player_or_owner_changed";
+        else if (!g_adsTraceChain.complete) result = "chain_incomplete";
+        else if (!exact) result = "candidate_mismatch";
+        else if (!candidateAlive || !adsAlive)
+            result = "controller_not_alive";
+        else if (headCount != 6 || validated != 6)
+            result = "six_head_validation_failed";
+        else result = "match";
+        ShFp2TraceAdsEvent(FFP_ADS_TRACE_COMPARE,
+            "comparison=%ld capture_epoch=%ld event_epoch=%ld "
+            "site=%s hook_tid=%lu captured_player=0x%llX "
+            "current_player=0x%llX chain_candidate=0x%llX "
+            "candidate_readable=%d candidate_vtable=0x%llX "
+            "candidate_owner=0x%llX candidate_node_count=%u "
+            "ads_controller=0x%llX exact_match=%d "
+            "candidate_ctrl_alive=%d ads_ctrl_alive=%d "
+            "controller_player=0x%llX player_match=%d "
+            "head_count=%d validated=%d prior_ads_controller=0x%llX "
+            "prior_ads_player=0x%llX controller_changed=%d "
+            "player_changed=%d result=%s",
+            (long)++g_adsTraceCompareSequence, (long)g_adsTraceChain.epoch,
+            (long)epoch, g_adsTraceAds[index].site ? "ADS_IN" : "ADS_OUT",
+            (unsigned long)g_adsTraceAds[index].threadId,
+            (unsigned long long)g_adsTraceChain.player,
+            (unsigned long long)player,
+            (unsigned long long)g_adsTraceChain.candidate,
+            candidateReadable, (unsigned long long)candidateVtable,
+            (unsigned long long)candidateOwner,
+            (unsigned)candidateNodeCount,
+            (unsigned long long)ads, exact, candidateAlive, adsAlive,
+            (unsigned long long)owner, playerMatch, headCount,
+            validated, (unsigned long long)previousController,
+            (unsigned long long)previousPlayer,
+            previousController && previousController != ads,
+            previousPlayer && previousPlayer != player, result);
+        ShFp2TraceAdsEvent(qualified ? FFP_ADS_TRACE_MATCH : FFP_ADS_TRACE_MISMATCH,
+            "comparison=%ld capture_epoch=%ld player=0x%llX "
+            "chain_candidate=0x%llX ads_controller=0x%llX "
+            "exact_match=%d qualified=%d result=%s",
+            (long)g_adsTraceCompareSequence, (long)epoch,
+            (unsigned long long)player,
+            (unsigned long long)g_adsTraceChain.candidate,
+            (unsigned long long)ads, exact, qualified, result);
+        if (player && ads) {
+            g_adsTraceLastAdsController = ads;
+            g_adsTraceLastAdsPlayer = player;
+        }
+    }
+}
+
+static int AcquireFp2Head(uint64_t entity, const char *reason) {
+    uint64_t heads[64], members[512], sig[64];
+    uint64_t priorCtrl, adsCandidate;
+    const char *source = "failure", *result = "no_current_player";
+    LARGE_INTEGER start, end, frequency;
+    ShPlayer player;
+    int i, j, n = 0, m = 0, free = 0, slots[64];
+    int validated = 0, held = 0;
+    QueryPerformanceCounter(&start);
+    ShFp2TraceStateEvent(FFP_STATE_ACQUIRE_BEGIN,
+        "reason=%s player=0x%llX fpp_active=%d ads_active=%d "
+        "saved_count=%ld held=%d global_sweep_entered=0",
+        reason, (unsigned long long)entity, ShFp2HeadRehideActive(),
+        ShFp2AdsActive(),
+        (long)InterlockedCompareExchange(&g_fp2Saved.count, 0, 0),
+        ShFp2HeadOwned());
+    ShFp2TraceLifecycleEvent(FFP_LIFECYCLE_BEGIN,
+        "entity=0x%llX controller_cache=0x%llX "
+        "ads_candidate=0x%llX resolver=cache_or_ads_only "
+        "global_sweep_allowed=0",
+        (unsigned long long)entity,
+        (unsigned long long)(g_headEnt == entity ? g_headCtrl : 0),
+        (unsigned long long)ShFp2NativeHeadCandidate());
+    if (!entity || !ShPeekPlayer(&player) || player.entity != entity) {
+        ShFp2TraceVisibilityEvent(FFP_VISIBILITY_ACTIVATE,
+            "entity=0x%llX controller_source=failure head_count=0 render_count=0",
+            (unsigned long long)entity);
+        goto done;
+    }
+    priorCtrl = g_headEnt == entity ? g_headCtrl : 0;
+    adsCandidate = ShFp2NativeHeadCandidate();
+    ProbeReforgedHeadRoot(entity);
+    n = GetHeadNodesInternal(entity, heads, 64, 0);
+    if (priorCtrl && priorCtrl == g_headCtrl) source = "existing_cache";
+    else if (adsCandidate && adsCandidate == g_headCtrl)
+        source = "ads_candidate";
+    else if (g_headCtrl) source = "bounded_chain";
+    ShFp2TraceStateEvent(FFP_STATE_RESOLVE,
+        "reason=%s player=0x%llX source=%s controller=0x%llX "
+        "owner_match=%d CtrlAlive=%d head_count=%d "
+        "global_sweep_entered=0",
+        reason, (unsigned long long)entity, source,
+        (unsigned long long)g_headCtrl,
+        g_headCtrl && ShReadQ(g_headCtrl + 0x28) == entity,
+        g_headCtrl && CtrlAlive(g_headCtrl, entity), n);
+    if (n > 0) m = ShGetEntityNodes(entity, members, 512);
+    ShFp2TraceVisibilityEvent(FFP_VISIBILITY_ACTIVATE,
+        "entity=0x%llX controller_source=%s head_count=%d render_count=%d",
+        (unsigned long long)entity, source, n, m);
+    result = "head_or_render_count";
+    if (n != 6 || m <= 0) goto done;
+    for (i = 0; i < n; ++i) {
+        sig[i] = ShReadQ(heads[i]);
+        if (!sig[i]) {
+            result = "invalid_identity";
+            goto done;
+        }
+        for (j = 0; j < m && members[j] != heads[i]; ++j) {}
+        if (j == m) {
+            result = "not_current_render_node";
+            goto done;
+        }
+        for (j = 0; j < i && heads[j] != heads[i]; ++j) {}
+        if (j != i) {
+            result = "duplicate_node";
+            goto done;
+        }
+        ++validated;
+    }
+    for (i = 0; i < VIS_HELD; ++i)
+        if (!g_visEnt[i] || g_visFp2[i]) ++free;
+    result = "no_slots";
+    if (free < n) {
+        goto done;
+    }
+    ShFp2HeadRelease(0);
+    for (i = 0, j = 0; i < VIS_HELD && j < n; ++i)
+        if (!g_visEnt[i]) slots[j++] = i;
+    if (j != n) {
+        result = "slot_race";
+        goto done;
+    }
+    for (i = 0; i < n; ++i) {
+        j = slots[i];
+        g_visNode[j] = heads[i];
+        g_visSig[j] = sig[i];
+        g_visWant[j] = 0;
+        g_visFp2[j] = 1;
+        g_visEnt[j] = entity;
+        ++held;
+        ShFp2TraceVisibilityEvent(FFP_VISIBILITY_HOLD,
+            "node=0x%llX saved_identity=0x%llX slot=%d result=held",
+            (unsigned long long)heads[i], (unsigned long long)sig[i], j);
+    }
+    AcquireSRWLockExclusive(&g_fp2CleanupLock);
+    g_fp2Saved.entity = entity;
+    for (i = 0; i < n; ++i) {
+        g_fp2Saved.node[i] = heads[i];
+        g_fp2Saved.identity[i] = sig[i];
+    }
+    InterlockedExchange(&g_fp2Saved.count, n);
+    ReleaseSRWLockExclusive(&g_fp2CleanupLock);
+    result = "held";
+done:
+    QueryPerformanceCounter(&end);
+    if (!QueryPerformanceFrequency(&frequency)) frequency.QuadPart = 0;
+    ShFp2TraceVisibilityEvent(FFP_VISIBILITY_ACTIVATE_RESULT,
+        "entity=0x%llX controller_source=%s validated=%d held=%d "
+        "elapsed_ms=%.3f result=%s",
+        (unsigned long long)entity, source, validated, held,
+        frequency.QuadPart ? (double)(end.QuadPart-start.QuadPart) *
+                             1000.0 / (double)frequency.QuadPart : 0.0,
+        result);
+    ShFp2TraceLifecycleEvent(FFP_LIFECYCLE_END,
+        "entity=0x%llX resolver_path=%s global_sweep_entered=0 "
+        "head_count=%d validated=%d hide_held=%d elapsed_ms=%.3f "
+        "enable_to_end_ms=%.3f "
+        "result=%s",
+        (unsigned long long)entity, source, n, validated, held,
+        frequency.QuadPart ? (double)(end.QuadPart-start.QuadPart) *
+                             1000.0 / (double)frequency.QuadPart : 0.0,
+        ShFp2TraceEnableElapsedMs(),
+        result);
+    ShFp2TraceStateEvent(FFP_STATE_ACQUIRE_END,
+        "reason=%s player=0x%llX source=%s controller=0x%llX "
+        "head_count=%d validated=%d held=%d elapsed_ms=%.3f "
+        "result=%s global_sweep_entered=0",
+        reason, (unsigned long long)entity, source,
+        (unsigned long long)g_headCtrl, n, validated, held,
+        frequency.QuadPart ? (double)(end.QuadPart-start.QuadPart) *
+                             1000.0 / (double)frequency.QuadPart : 0.0,
+        result);
+    return held;
+}
+
+int ShFp2HeadAcquire(uint64_t entity) {
+    return AcquireFp2Head(entity, "immediate_fpp");
+}
+
+static int CensusAddress(const char *role, uint64_t address,
+                         MEMORY_BASIC_INFORMATION *out) {
+    memset(out, 0, sizeof(*out));
+    if (!address || !VirtualQuery((const void *)(uintptr_t)address,
+                                  out, sizeof(*out))) {
+        ShFp2TraceCensusEvent("LOCALITY role=%s address=0x%llX query=failed",
+            role, (unsigned long long)address);
+        return 0;
+    }
+    ShFp2TraceCensusEvent(
+        "LOCALITY role=%s address=0x%llX BaseAddress=0x%llX "
+        "AllocationBase=0x%llX RegionSize=0x%llX State=0x%lX "
+        "Protect=0x%lX Type=0x%lX",
+        role, (unsigned long long)address,
+        (unsigned long long)(uintptr_t)out->BaseAddress,
+        (unsigned long long)(uintptr_t)out->AllocationBase,
+        (unsigned long long)out->RegionSize,
+        (unsigned long)out->State, (unsigned long)out->Protect,
+        (unsigned long)out->Type);
+    return 1;
+}
+
+static uint64_t CensusDelta(uint64_t controller, uint64_t target,
+                            const char *role) {
+    int64_t delta = (int64_t)target - (int64_t)controller;
+    uint64_t absolute = delta < 0 ? (uint64_t)-delta : (uint64_t)delta;
+    ShFp2TraceCensusEvent("DELTA controller_to=%s target=0x%llX signed=%lld absolute=%llu",
+        role, (unsigned long long)target, (long long)delta,
+        (unsigned long long)absolute);
+    return absolute;
+}
+
+static void ShFp2HeadLocality(uint64_t controller, uint64_t entity,
+                             const uint64_t *heads, int count) {
+    MEMORY_BASIC_INFORMATION ctrlMbi, arrMbi, entityMbi, headMbi;
+    uint64_t arr, nearest = 0, nearestDistance = UINT64_MAX;
+    int ctrlOk, arrOk, entityOk, firstOk = 0;
+    int anyAlloc = 0, anyRegion = 0, allHeadQueries = 1, i;
+    int firstAlloc = 0, firstRegion = 0;
+    char role[32];
+    if (!controller || !count) {
+        ShFp2TraceCensusEvent("LOCALITY unavailable controller=0x%llX count=%d",
+            (unsigned long long)controller, count);
         return;
     }
+    arr = ShReadQ(controller + CTRL_NODES);
+    ctrlOk = CensusAddress("controller", controller, &ctrlMbi);
+    arrOk = CensusAddress("ctrl_nodes_array", arr, &arrMbi);
+    entityOk = CensusAddress("player_entity", entity, &entityMbi);
+    for (i = 0; i < count; ++i) {
+        uint64_t distance = heads[i] > controller ? heads[i] - controller
+                                                   : controller - heads[i];
+        int headOk;
+        snprintf(role, sizeof(role), "head_node_%d", i);
+        headOk = CensusAddress(role, heads[i], &headMbi);
+        if (!headOk) allHeadQueries = 0;
+        if (headOk && ctrlOk) {
+            int sameAlloc = headMbi.AllocationBase == ctrlMbi.AllocationBase;
+            int sameRegion = headMbi.BaseAddress == ctrlMbi.BaseAddress;
+            if (i == 0) {
+                firstOk = 1;
+                firstAlloc = sameAlloc;
+                firstRegion = sameRegion;
+            }
+            anyAlloc |= sameAlloc;
+            anyRegion |= sameRegion;
+        }
+        if (distance < nearestDistance) {
+            nearestDistance = distance;
+            nearest = heads[i];
+        }
+    }
+    ShFp2TraceCensusEvent(
+        "RELATION ctrl_same_allocation_as_array=%s player=%s any_head=%s "
+        "ctrl_same_region_as_any_head=%s",
+        ctrlOk && arrOk ? (ctrlMbi.AllocationBase == arrMbi.AllocationBase ? "yes" : "no") : "unavailable",
+        ctrlOk && entityOk ? (ctrlMbi.AllocationBase == entityMbi.AllocationBase ? "yes" : "no") : "unavailable",
+        ctrlOk && (anyAlloc || allHeadQueries) ? (anyAlloc ? "yes" : "no") : "unavailable",
+        ctrlOk && (anyRegion || allHeadQueries) ? (anyRegion ? "yes" : "no") : "unavailable");
+    CensusDelta(controller, arr, "ctrl_nodes_array");
+    CensusDelta(controller, heads[0], "first_head_node");
+    CensusDelta(controller, nearest, "nearest_head_node");
+    CensusDelta(controller, entity, "player_entity");
+    ShFp2TraceCensusEvent(
+        "HYPOTHESIS A_first_head_allocation=%s B_first_head_region=%s "
+        "C_ctrl_nodes_allocation=%s D_head_window_16MiB=%s "
+        "D_head_window_64MiB=%s D_head_window_256MiB=%s "
+        "nearest_head=0x%llX nearest_distance=%llu",
+        ctrlOk && firstOk ? (firstAlloc ? "yes" : "no") : "unavailable",
+        ctrlOk && firstOk ? (firstRegion ? "yes" : "no") : "unavailable",
+        ctrlOk && arrOk ? (ctrlMbi.AllocationBase == arrMbi.AllocationBase ? "yes" : "no") : "unavailable",
+        nearestDistance <= 16ull*1024*1024 ? "yes" : "no",
+        nearestDistance <= 64ull*1024*1024 ? "yes" : "no",
+        nearestDistance <= 256ull*1024*1024 ? "yes" : "no",
+        (unsigned long long)nearest,
+        (unsigned long long)nearestDistance);
+}
+
+/* Read-only acquisition with optional scan census. */
+void ShFp2HeadProbe(void) {
+    Fp2TraceToken total = ShFp2TraceAcquireBegin();
+    Fp2TraceToken stage;
+    ShPlayer player;
+    uint64_t heads[64], signatures[64], cachedHeads[64], members[512];
+    int i, j, n, m, ok, cachedCount;
+    uint64_t foundController;
+    if (!total.sequence) return;
+
+    stage = ShFp2TraceAcquireStageBegin("PLAYER");
+    ok = ShPeekPlayer(&player) && player.entity != 0;
+    ShFp2TraceAcquireStageEnd(stage, "result=%d entity=0x%llX",
+        ok, (unsigned long long)(ok ? player.entity : 0));
+    if (!ok) {
+        ShFp2TraceAcquireEnd(total, 0, "no_current_player");
+        return;
+    }
+
+    stage = ShFp2TraceAcquireStageBegin("HEADNODES");
+    g_censusThread = GetCurrentThreadId();
+    InterlockedExchange(&g_censusActive, 1);
+    n = ShGetHeadNodes(player.entity, heads, 64);
+    InterlockedExchange(&g_censusActive, 0);
+    foundController = g_headCtrl;
+    ShFp2TraceAcquireStageEnd(stage, "count=%d", n);
+    if (n <= 0) {
+        ShFp2TraceAcquireEnd(total, 0, "no_head_nodes");
+        return;
+    }
+
+    stage = ShFp2TraceAcquireStageBegin("CACHE_RECHECK");
+    cachedCount = ShGetHeadNodes(player.entity, cachedHeads, 64);
+    ShFp2TraceAcquireStageEnd(stage, "count=%d", cachedCount);
+    ShFp2HeadLocality(foundController, player.entity, heads, n);
+
+    stage = ShFp2TraceAcquireStageBegin("ENTITYNODES");
+    m = ShGetEntityNodes(player.entity, members, 512);
+    ShFp2TraceAcquireStageEnd(stage, "count=%d", m);
+    if (m <= 0) {
+        ShFp2TraceAcquireEnd(total, 0, "no_render_nodes");
+        return;
+    }
+
+    stage = ShFp2TraceAcquireStageBegin("MEMBERSHIP");
+    for (i = 0; i < n; ++i) {
+        for (j = 0; j < m && members[j] != heads[i]; ++j) {}
+        if (j == m) break;
+        for (j = 0; j < i && heads[j] != heads[i]; ++j) {}
+        if (j != i) break;
+    }
+    ShFp2TraceAcquireStageEnd(stage, "result=%d validated=%d head_count=%d render_count=%d",
+        i == n, i, n, m);
+    if (i != n) {
+        ShFp2TraceAcquireEnd(total, 0, "membership_or_duplicate");
+        return;
+    }
+
+    stage = ShFp2TraceAcquireStageBegin("IDENTITY");
+    for (i = 0; i < n; ++i) {
+        signatures[i] = ShReadQ(heads[i]);
+        if (!signatures[i]) break;
+    }
+    ShFp2TraceAcquireStageEnd(stage, "result=%d validated=%d head_count=%d",
+        i == n, i, n);
+    ShFp2TraceAcquireEnd(total, i == n,
+        i == n ? "validated_read_only" : "invalid_node_identity");
+    if (i == n) {
+        g_directGround.entity = player.entity;
+        g_directGround.controller = foundController;
+        g_directGround.array = ShReadQ(foundController + CTRL_NODES);
+        g_directGround.count = n;
+        memcpy(g_directGround.heads, heads, (size_t)n * sizeof(heads[0]));
+        memcpy(g_directGround.signatures, signatures,
+               (size_t)n * sizeof(signatures[0]));
+        InterlockedExchange(&g_directReady, 1);
+        ShFp2MaybeDirectCensus();
+    }
+}
+
+#define DIRECT_ONE_HOP_MAX 48
+
+typedef struct {
+    Fp2DirectMetrics metrics;
+    uint64_t controller, array, entity, arg, a2, transform;
+    uint64_t heads[64], components[512], renderNodes[512];
+    uint64_t examinedChildren[DIRECT_ONE_HOP_MAX];
+    int headCount, componentSlots, renderCount, examinedCount;
+} DirectCensus;
+
+static void DirectMatch(DirectCensus *ctx, const char *root,
+                        uint64_t rootAddress, int rootIndex, int offset,
+                        uint64_t value, const char *target, int targetIndex) {
+    ++ctx->metrics.directMatches;
+    ShFp2TraceDirectEvent(
+        "DIRECT_MATCH root_type=%s root_address=0x%llX root_index=%d "
+        "offset=0x%03X value=0x%llX target_type=%s target_index=%d",
+        root, (unsigned long long)rootAddress, rootIndex, offset,
+        (unsigned long long)value, target, targetIndex);
+}
+
+static void DirectOneHop(DirectCensus *ctx, const char *root,
+                         int rootOffset, uint64_t child) {
+    uint64_t fields[0x100 / 8];
+    int i;
+    if (!child || ctx->examinedCount >= DIRECT_ONE_HOP_MAX ||
+        !ShReadableAddr(child, 0x100)) return;
+    for (i = 0; i < ctx->examinedCount; ++i)
+        if (ctx->examinedChildren[i] == child) return;
+    ctx->examinedChildren[ctx->examinedCount++] = child;
+    ctx->metrics.oneHopCandidates = ctx->examinedCount;
+    if (!ShReadMem(child, fields, sizeof(fields))) return;
+    ++ctx->metrics.readableChildren;
+    ctx->metrics.oneHopFields += sizeof(fields) / sizeof(fields[0]);
+    for (i = 0; i < (int)(sizeof(fields) / sizeof(fields[0])); ++i) {
+        const char *target = NULL;
+        if (fields[i] == ctx->controller) target = "controller";
+        else if (fields[i] == ctx->array) target = "ctrl_nodes_array";
+        if (!target) continue;
+        ++ctx->metrics.oneHopMatches;
+        ShFp2TraceDirectEvent(
+            "ONE_HOP_MATCH root_type=%s root_offset=0x%03X "
+            "child_address=0x%llX child_offset=0x%03X "
+            "target_type=%s target_address=0x%llX",
+            root, rootOffset, (unsigned long long)child, i * 8,
+            target, (unsigned long long)fields[i]);
+    }
+}
+
+static void DirectScanRoot(DirectCensus *ctx, const char *root,
+                           uint64_t address, int index, int bytes,
+                           int oneHop) {
+    uint64_t fields[0x200 / 8] = {0};
+    uint8_t valid[0x200 / 8] = {0};
+    int count = bytes / 8, i, j;
+    if (!address) return;
+    if (ShReadMem(address, fields, (size_t)bytes)) {
+        memset(valid, 1, (size_t)count);
+    } else {
+        for (i = 0; i < count; ++i)
+            valid[i] = (uint8_t)ShReadMem(address + (uint64_t)i * 8,
+                                          &fields[i], 8);
+    }
+    for (i = 0; i < count; ++i) {
+        uint64_t value;
+        if (!valid[i]) continue;
+        ++ctx->metrics.directFields;
+        value = fields[i];
+        if (!value) continue;
+        if (value == ctx->controller)
+            DirectMatch(ctx, root, address, index, i * 8, value,
+                        "controller", -1);
+        if (value == ctx->array)
+            DirectMatch(ctx, root, address, index, i * 8, value,
+                        "ctrl_nodes_array", -1);
+        if (value == ctx->entity)
+            DirectMatch(ctx, root, address, index, i * 8, value,
+                        "player_entity", -1);
+        if (value == ctx->arg)
+            DirectMatch(ctx, root, address, index, i * 8, value,
+                        "head_call_arg", -1);
+        if (ctx->a2 && value == ctx->a2)
+            DirectMatch(ctx, root, address, index, i * 8, value,
+                        "a2", -1);
+        if (value == ctx->transform)
+            DirectMatch(ctx, root, address, index, i * 8, value,
+                        "captured_transform", -1);
+        for (j = 0; j < ctx->headCount; ++j)
+            if (value == ctx->heads[j])
+                DirectMatch(ctx, root, address, index, i * 8, value,
+                            "head_node", j);
+        if (!strcmp(root, "controller")) {
+            for (j = 0; j < ctx->componentSlots; ++j)
+                if (ctx->components[j] && value == ctx->components[j])
+                    DirectMatch(ctx, root, address, index, i * 8, value,
+                                "component", j);
+            for (j = 0; j < ctx->renderCount; ++j)
+                if (value == ctx->renderNodes[j])
+                    DirectMatch(ctx, root, address, index, i * 8, value,
+                                "render_node", j);
+        }
+        if (oneHop) DirectOneHop(ctx, root, i * 8, value);
+    }
+}
+
+static void ShFp2MaybeDirectCensus(void) {
+    DirectCensus ctx = {0};
+    Fp2TraceToken token;
+    ShPlayer player;
+    uint64_t componentArray;
+    uint16_t componentSlots = 0;
+    int i, j, valid;
+    const char *result = "complete";
+    if (!g_directReady ||
+        InterlockedCompareExchange(&g_captureReady, 0, 0) != 2 ||
+        InterlockedCompareExchange(&g_directDone, 1, 0)) return;
+    token = ShFp2TraceDirectBegin();
+    if (!token.sequence) return;
+    ctx.controller = g_directGround.controller;
+    ctx.array = g_directGround.array;
+    ctx.entity = g_directGround.entity;
+    ctx.headCount = g_directGround.count;
+    ctx.arg = g_directCapture.arg;
+    ctx.a2 = g_directCapture.a2;
+    ctx.transform = g_directCapture.transform;
+    memcpy(ctx.heads, g_directGround.heads,
+           (size_t)ctx.headCount * sizeof(ctx.heads[0]));
+    ShFp2TraceDirectEvent(
+        "GROUND_TRUTH controller=0x%llX ctrl_nodes_array=0x%llX "
+        "player_entity=0x%llX head_count=%d",
+        (unsigned long long)ctx.controller,
+        (unsigned long long)ctx.array,
+        (unsigned long long)ctx.entity, ctx.headCount);
+    for (i = 0; i < ctx.headCount; ++i)
+        ShFp2TraceDirectEvent(
+            "GROUND_HEAD index=%d node=0x%llX signature=0x%llX",
+            i, (unsigned long long)ctx.heads[i],
+            (unsigned long long)g_directGround.signatures[i]);
+    ShFp2TraceDirectEvent(
+        "HEAD_CAPTURE arg=0x%llX a2=0x%llX transform=0x%llX entity=0x%llX",
+        (unsigned long long)ctx.arg, (unsigned long long)ctx.a2,
+        (unsigned long long)ctx.transform,
+        (unsigned long long)g_directCapture.entity);
+
+    if (g_directCapture.entity != ctx.entity ||
+        !ShPeekPlayer(&player) || player.entity != ctx.entity) {
+        result = "player_changed";
+        goto done;
+    }
+    if (!CtrlAlive(ctx.controller, ctx.entity) ||
+        ShReadQ(ctx.controller + CTRL_NODES) != ctx.array) {
+        result = "controller_changed";
+        goto done;
+    }
+    ctx.renderCount = ShGetEntityNodes(ctx.entity, ctx.renderNodes, 512);
+    ctx.metrics.renderNodes = ctx.renderCount;
+    if (ctx.renderCount <= 0) {
+        result = "no_current_render_nodes";
+        goto done;
+    }
+    for (i = 0; i < ctx.headCount; ++i) {
+        valid = ShReadQ(ctx.heads[i]) == g_directGround.signatures[i];
+        for (j = 0; j < ctx.renderCount &&
+                    ctx.renderNodes[j] != ctx.heads[i]; ++j) {}
+        if (!valid || j == ctx.renderCount) {
+            result = "stale_head_node";
+            goto done;
+        }
+    }
+    ShFp2TraceDirectEvent("HEAD_REVALIDATION result=valid count=%d current_render_nodes=%d",
+                         ctx.headCount, ctx.renderCount);
+
+    componentArray = ShReadQ(ctx.entity + OFF_ENT_COMPS);
+    if (!componentArray ||
+        !ShReadMem(ctx.entity + OFF_ENT_NCOMPS, &componentSlots, 2) ||
+        !componentSlots || componentSlots > 512 ||
+        !ShReadMem(componentArray, ctx.components,
+                   (size_t)componentSlots * 8)) {
+        result = "component_array_unreadable";
+        goto done;
+    }
+    ctx.componentSlots = componentSlots;
+    for (i = 0; i < ctx.componentSlots; ++i) {
+        uint32_t hash;
+        if (!ctx.components[i]) continue;
+        ++ctx.metrics.components;
+        hash = ClassHashOf(ctx.components[i]);
+        ShFp2TraceDirectEvent("COMPONENT index=%d address=0x%llX class_hash=0x%08X",
+            i, (unsigned long long)ctx.components[i], hash);
+    }
+    ShFp2TraceDirectEvent("ROOT_COUNTS components=%d render_nodes=%d",
+        ctx.metrics.components, ctx.metrics.renderNodes);
+
+    DirectScanRoot(&ctx, "player_entity", ctx.entity, -1, 0x200, 0);
+    for (i = 0; i < ctx.componentSlots; ++i)
+        if (ctx.components[i])
+            DirectScanRoot(&ctx, "component", ctx.components[i], i,
+                           0x200, 0);
+    for (i = 0; i < ctx.renderCount; ++i)
+        DirectScanRoot(&ctx, "render_node", ctx.renderNodes[i], i,
+                       0x100, 0);
+    DirectScanRoot(&ctx, "head_call_arg", ctx.arg, -1, 0x200, 1);
+    DirectScanRoot(&ctx, "a2", ctx.a2, -1, 0x200, 1);
+    DirectScanRoot(&ctx, "captured_transform", ctx.transform,
+                   -1, 0x200, 1);
+    DirectScanRoot(&ctx, "controller", ctx.controller, -1, 0x100, 0);
+done:
+    ShFp2TraceDirectEnd(token, &ctx.metrics, result);
+}
+
+void ShFp2DirectRefsCapture(uint64_t arg, uint64_t a2,
+                            uint64_t transform, uint64_t entity) {
+    if (!arg || !transform || !entity || g_directDone) return;
+    if (InterlockedCompareExchange(&g_captureReady, 1, 0) == 0) {
+        g_directCapture.arg = arg;
+        g_directCapture.a2 = a2;
+        g_directCapture.transform = transform;
+        g_directCapture.entity = entity;
+        InterlockedExchange(&g_captureReady, 2);
+    }
+}
+
+void ShFp2DirectRefsRun(void) {
+    ShFp2MaybeDirectCensus();
+}
+
+int ShFp2HeadOwned(void) {
+    int i, n = 0;
+    for (i = 0; i < VIS_HELD; ++i)
+        if (g_visFp2[i] && g_visEnt[i]) ++n;
+    return n;
 }
 
 
@@ -454,17 +1562,182 @@ static int SetOneNode(uint64_t node, int hidden) {
     return NodeFlag(node, hidden);
 }
 
+static int SetFp2Node(uint64_t entity, uint64_t node, uint64_t sig,
+                      int visible, int once) {
+    uint16_t before = 0, after = 0;
+    int beforeValid, afterValid, result;
+    (void)entity;
+    (void)sig;
+    if (!once || !visible || !ShFp2TraceShowPumpWanted())
+        return SetOneNode(node, visible ? 0 : 1);
+    beforeValid = ShReadMem(node + NODE_FLAGS, &before, 2);
+    result = SetOneNode(node, visible ? 0 : 1);
+    afterValid = ShReadMem(node + NODE_FLAGS, &after, 2);
+    ShFp2TraceDisableEvent(FFP_DISABLE_SHOW_PUMP,
+        "node=0x%llX flags_before=%s0x%04X "
+        "flags_after=%s0x%04X result=%d",
+        (unsigned long long)node,
+        beforeValid ? "" : "unavailable:", (unsigned)before,
+        afterValid ? "" : "unavailable:", (unsigned)after, result);
+    return result;
+}
+
+static void QueueSavedAdsRehide(LONG event) {
+    uint64_t entity = g_fp2Saved.entity;
+    int i, count = (int)g_fp2Saved.count, validCount = 0, queuedCount = 0;
+    int active = ShFp2HeadRehideActive() &&
+                 ShStateReadOnly() == SH_STATE_INGAME;
+    if (count > FP2_SAVED_HEADS) count = FP2_SAVED_HEADS;
+    ShFp2TraceRehideEvent(FFP_REHIDE_BEGIN,
+        "site=%s raw_state=%ld requested_while_fpp_active=1 "
+        "active_at_pump=%d saved_entity=0x%llX saved_count=%d",
+        event == 2 ? "ADS_IN" : "ADS_OUT", (long)(event - 1),
+        active, (unsigned long long)entity, count);
+    for (i = 0; active && entity && i < count; ++i) {
+        uint64_t node = g_fp2Saved.node[i];
+        uint64_t saved = g_fp2Saved.identity[i];
+        uint64_t current = node ? ShReadQ(node) : 0;
+        int valid = node && saved && current == saved;
+        int queued = valid ? QueueVisibilityOwned(entity, node, 0, 1,
+                                                   saved) : 0;
+        validCount += valid;
+        queuedCount += queued;
+        ShFp2TraceRehideEvent(FFP_REHIDE_SLOT,
+            "slot=%d node=0x%llX saved_identity=0x%llX "
+            "current_identity=0x%llX identity=%s queued=%d",
+            i, (unsigned long long)node, (unsigned long long)saved,
+            (unsigned long long)current, valid ? "valid" : "invalid",
+            queued);
+    }
+    ShFp2TraceRehideEvent(FFP_REHIDE_END,
+        "valid=%d queued=%d active_at_pump=%d", validCount,
+        queuedCount, active);
+}
+
+static int SavedFp2HoldsValid(uint64_t entity) {
+    uint64_t members[512];
+    int i, j, memberCount, valid = 1;
+    memberCount = ShGetEntityNodes(entity, members, 512);
+    if (memberCount <= 0) return 0;
+    AcquireSRWLockShared(&g_fp2CleanupLock);
+    if (g_fp2Saved.entity != entity ||
+        g_fp2Saved.count != FP2_SAVED_HEADS) valid = 0;
+    for (i = 0; valid && i < FP2_SAVED_HEADS; ++i) {
+        uint64_t node = g_fp2Saved.node[i];
+        uint64_t sig = g_fp2Saved.identity[i];
+        int found = 0;
+        if (!node || !sig || ShReadQ(node) != sig) {
+            valid = 0;
+            break;
+        }
+        for (j = 0; j < memberCount && members[j] != node; ++j) {}
+        if (j == memberCount) {
+            valid = 0;
+            break;
+        }
+        for (j = 0; j < VIS_HELD; ++j)
+            if (g_visFp2[j] && g_visEnt[j] == entity &&
+                g_visNode[j] == node && g_visSig[j] == sig &&
+                !g_visWant[j]) {
+                found = 1;
+                break;
+            }
+        if (!found) valid = 0;
+    }
+    ReleaseSRWLockShared(&g_fp2CleanupLock);
+    return valid;
+}
+
+static void ProcessFp2AdsHeadEvent(LONG event) {
+    ShPlayer player;
+    int active = ShFp2HeadRehideActive() &&
+                 ShStateReadOnly() == SH_STATE_INGAME;
+    int held = 0, recovered = 0;
+    uint64_t entity = 0;
+    if ((active || ShFp2TraceLifecycleWanted()) &&
+        ShStateReadOnly() == SH_STATE_INGAME &&
+        ShPeekPlayer(&player) && player.entity)
+        entity = player.entity;
+    ShFp2TraceStateEvent(FFP_STATE_UPDATE,
+        "event=%s player=0x%llX fpp_active=%d ads_active=%d "
+        "saved_count=%ld global_sweep_entered=0",
+        event == 2 ? "ADS_IN" : "ADS_OUT",
+        (unsigned long long)entity, active, ShFp2AdsActive(),
+        (long)InterlockedCompareExchange(&g_fp2Saved.count, 0, 0));
+    if (!active) {
+        if (entity) {
+            uint64_t ctrl = ShFp2NativeHeadCandidate();
+            uint64_t arr, heads[FP2_SAVED_HEADS];
+            int i, headCount = 0, validated = 0, hidden = 0;
+            if (Fp2ControllerValid(ctrl, entity, &headCount, &validated)) {
+                arr = ShReadQ(ctrl + CTRL_NODES);
+                if (arr && ShReadMem(arr, heads, sizeof(heads)))
+                    for (i = 0; i < FP2_SAVED_HEADS; ++i) {
+                        uint16_t flags = 0;
+                        if (ShReadMem(heads[i] + NODE_FLAGS,
+                                      &flags, sizeof(flags)) &&
+                            (flags & NODE_HIDDEN)) ++hidden;
+                    }
+            }
+            ShFp2TraceStateEvent(FFP_STATE_UPDATE,
+                "event=%s perspective=TPP player=0x%llX ads_active=%d "
+                "native_controller=0x%llX head_count=%d validated=%d "
+                "native_hidden_count=%d fp2_owned=0",
+                event == 2 ? "ADS_IN" : "ADS_OUT",
+                (unsigned long long)entity, ShFp2AdsActive(),
+                (unsigned long long)ctrl, headCount, validated, hidden);
+        }
+        return;
+    }
+    if (!entity) return;
+    held = SavedFp2HoldsValid(entity);
+    if (!held) {
+        recovered = AcquireFp2Head(entity, "ads_recovery");
+        ShFp2TraceStateEvent(FFP_STATE_ADS_RECOVERY,
+            "event=%s player=0x%llX fpp_active=1 ads_active=%d "
+            "existing_hold=0 recovered_holds=%d result=%s "
+            "global_sweep_entered=0",
+            event == 2 ? "ADS_IN" : "ADS_OUT",
+            (unsigned long long)entity, ShFp2AdsActive(),
+            recovered, recovered == FP2_SAVED_HEADS ?
+                       "six_held" : "fail_closed");
+    } else {
+        ShFp2TraceStateEvent(FFP_STATE_ADS_RECOVERY,
+            "event=%s player=0x%llX fpp_active=1 ads_active=%d "
+            "existing_hold=1 recovered_holds=0 result=existing_hold",
+            event == 2 ? "ADS_IN" : "ADS_OUT",
+            (unsigned long long)entity, ShFp2AdsActive());
+    }
+    if (held || recovered == FP2_SAVED_HEADS) {
+        AcquireSRWLockShared(&g_fp2CleanupLock);
+        QueueSavedAdsRehide(event);
+        ReleaseSRWLockShared(&g_fp2CleanupLock);
+    }
+}
+
 /* Called from the camera detour, on the game thread, which
  * is where the engine stamps these bits back.
  */
 void ShVisibilityPump(void) {
-    int i, seen;
+    ShPlayer player;
+    uint64_t members[512];
+    LONG adsEvent = InterlockedExchange(&g_fp2AdsRehideEvent, 0);
+    int i, j, seen, memberCount = -1;
 
+    ProcessAdsTraceComparisons();
+    if (adsEvent) ProcessFp2AdsHeadEvent(adsEvent);
+    AcquireSRWLockShared(&g_fp2CleanupLock);
     for (i = 0; i < VIS_ONCE; i++) {
         if (!g_onceEnt[i]) continue;
         if (g_onceNode[i]) {
-            if (ShReadQ(g_onceNode[i]) == g_onceSig[i])
-                SetOneNode(g_onceNode[i], g_onceWant[i] ? 0 : 1);
+            if ((!g_onceFp2[i] ||
+                 CurrentPlayerHasNode(g_onceEnt[i], g_onceNode[i])) &&
+                ShReadQ(g_onceNode[i]) == g_onceSig[i]) {
+                (g_onceFp2[i] ?
+                    SetFp2Node(g_onceEnt[i], g_onceNode[i], g_onceSig[i],
+                               g_onceWant[i], 1) :
+                    SetOneNode(g_onceNode[i], g_onceWant[i] ? 0 : 1));
+            }
         } else {
             seen = 0;
             SetNodesHidden(g_onceEnt[i], g_onceWant[i] ? 0 : 1,
@@ -473,22 +1746,41 @@ void ShVisibilityPump(void) {
         g_onceEnt[i] = 0;
         g_onceNode[i] = 0;
         g_onceSig[i] = 0;
+        g_onceFp2[i] = 0;
     }
-
     for (i = 0; i < VIS_HELD; i++) {
+        const char *lostReason = NULL;
         if (!g_visEnt[i]) continue;
         seen = 0;
+        if (g_visFp2[i]) {
+            if (ShStateReadOnly() != SH_STATE_INGAME) goto retire;
+            if (memberCount < 0) {
+                memberCount = 0;
+                if (ShPeekPlayer(&player) && player.entity)
+                    memberCount = ShGetEntityNodes(player.entity,
+                                                   members, 512);
+            }
+            if (!memberCount || player.entity != g_visEnt[i])
+                goto retire;
+            for (j = 0; j < memberCount && members[j] != g_visNode[i];
+                 ++j) {}
+            if (j == memberCount) {
+                lostReason = "not_current_render_node";
+                goto retire;
+            }
+        }
         if (g_visNode[i]) {
             /* Readable is a weak test: recycled memory
              * still reads. The vtable must match too, or
              * the write lands in someone else's object. */
             if (ShReadQ(g_visNode[i]) != g_visSig[i]) {
-                g_visEnt[i] = 0;
-                g_visNode[i] = 0;
-                g_visSig[i] = 0;
-                continue;
+                lostReason = "identity_mismatch";
+                goto retire;
             }
-            seen = SetOneNode(g_visNode[i], g_visWant[i] ? 0 : 1);
+            seen = g_visFp2[i] ?
+                SetFp2Node(g_visEnt[i], g_visNode[i], g_visSig[i],
+                           g_visWant[i], 0) :
+                SetOneNode(g_visNode[i], g_visWant[i] ? 0 : 1);
         } else {
             SetNodesHidden(g_visEnt[i], g_visWant[i] ? 0 : 1, &seen);
         }
@@ -496,11 +1788,21 @@ void ShVisibilityPump(void) {
          * rather than writing into recycled memory.
          */
         if (!seen) {
+            if (g_visFp2[i]) lostReason = "write_failed";
+retire:
+            if (g_visFp2[i] && lostReason)
+                ShFp2TraceVisibilityEvent(FFP_VISIBILITY_HOLD_LOST,
+                    "slot=%d node=0x%llX saved_identity=0x%llX reason=%s",
+                    i, (unsigned long long)g_visNode[i],
+                    (unsigned long long)g_visSig[i], lostReason);
             g_visEnt[i] = 0;
             g_visNode[i] = 0;
             g_visSig[i] = 0;
+            g_visWant[i] = 0;
+            g_visFp2[i] = 0;
         }
     }
+    ReleaseSRWLockShared(&g_fp2CleanupLock);
 }
 
 /* node 0 means every render node on the entity. persist
@@ -554,7 +1856,8 @@ SH_API int ShGetEntityNodes(uint64_t entity, uint64_t *out,
 /* Safe from any thread: every access is a kernel read, so
  * a page freed mid walk fails instead of faulting, and the
  * scan never touches the frame budget. */
-SH_API int ShGetHeadNodes(uint64_t entity, uint64_t *out, int max) {
+static int GetHeadNodesInternal(uint64_t entity, uint64_t *out,
+                                int max, int allowSweep) {
     uint64_t ctrl, arr, nodes[64];
     uint16_t n = 0, i;
     int w = 0;
@@ -563,7 +1866,7 @@ SH_API int ShGetHeadNodes(uint64_t entity, uint64_t *out, int max) {
         ShSetError(SH_ERR_BAD_ARG);
         return 0;
     }
-    ctrl = FindHeadGroup(entity);
+    ctrl = FindHeadGroup(entity, allowSweep);
     if (!ctrl) { ShSetError(SH_ERR_NO_CANDIDATE); return 0; }
     arr = ShReadQ(ctrl + CTRL_NODES);
     if (!arr || !ShReadMem(ctrl + CTRL_COUNT, &n, 2)) return 0;
@@ -574,6 +1877,10 @@ SH_API int ShGetHeadNodes(uint64_t entity, uint64_t *out, int max) {
         if (nodes[i]) out[w++] = nodes[i];
     ShSetError(SH_OK);
     return w;
+}
+
+SH_API int ShGetHeadNodes(uint64_t entity, uint64_t *out, int max) {
+    return GetHeadNodesInternal(entity, out, max, 1);
 }
 
 /** How many render nodes an entity has, 0 if none. */

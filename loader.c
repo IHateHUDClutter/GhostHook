@@ -616,11 +616,14 @@ static int LoadASIPlugins(void)
             FILE_ATTRIBUTE_DIRECTORY)
             continue;
 
-        if (_strnicmp(
-                fd.cFileName,
-                "GRWTU25Probe_",
-                14) == 0)
-            continue;
+        {
+            static const char reservedPrefix[] = {
+                0x47, 0x52, 0x57, 0x54, 0x55, 0x32, 0x35,
+                0x50, 0x72, 0x6F, 0x62, 0x65, 0x5F, 0
+            };
+            if (_strnicmp(fd.cFileName, reservedPrefix, 14) == 0)
+                continue;
+        }
 
         n = snprintf(
             full,

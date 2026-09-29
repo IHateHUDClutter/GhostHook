@@ -7,6 +7,7 @@
 
 #define SH_BUILD 1
 #include "scripthook.h"
+#include "player_peek.h"
 #include "image.h"
 #include "log.h"
 
@@ -537,14 +538,18 @@ SH_API int ShGetPlayer(ShPlayer *out) {
 /* For the frame path. Never scans, never blocks: a scan in
  * flight on another thread reads as a miss, and the state
  * machine is left alone since a camera frame implies it. */
-int ShPeekPlayer(ShPlayer *out) {
+enum ShPlayerPeekResult ShPeekPlayerReason(ShPlayer *out) {
     int ok;
 
-    if (!out) return 0;
-    if (!TryAcquireSRWLockExclusive(&g_playerLock)) return 0;
+    if (!out) return PEEK_LOOKUP_MISS;
+    if (!TryAcquireSRWLockExclusive(&g_playerLock)) return PEEK_LOCK_BUSY;
     ok = ShPlayerLocked(out, 0);
     ReleaseSRWLockExclusive(&g_playerLock);
-    return ok;
+    return ok ? PEEK_OK : PEEK_LOOKUP_MISS;
+}
+
+int ShPeekPlayer(ShPlayer *out) {
+    return ShPeekPlayerReason(out) == PEEK_OK;
 }
 
 SH_API int ShGetVersion(void) {

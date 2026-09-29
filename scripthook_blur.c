@@ -11,6 +11,7 @@
 #define SH_BUILD 1
 #include "scripthook.h"
 #include "image.h"
+#include "fp2_internal.h"
 
 #define BLUR_MATCH  SH_IMG(0x14E7625C)
 #define BLUR_IMM    5
@@ -45,24 +46,33 @@ static int BlurSiteOk(void) {
 
 /** on=0 removes the close range blur, on=1 restores it. */
 SH_API int ShSetCameraBlur(int on) {
+    Fp2TraceToken diag = ShFp2TraceEnter("ShSetCameraBlur",
+        __builtin_return_address(0), "on=%d", on);
     uint8_t *b = (uint8_t *)(uintptr_t)(BLUR_MATCH + BLUR_IMM);
     uint8_t want = on ? 0x01 : 0x00;
     DWORD old;
 
     if (!BlurSiteOk()) {
         ShSetError(SH_ERR_NO_CANDIDATE);
+        ShFp2TraceExit(diag, "int=0 site=invalid");
         return 0;
     }
-    if (*b == want) { ShSetError(SH_OK); return 1; }
+    if (*b == want) {
+        ShSetError(SH_OK);
+        ShFp2TraceExit(diag, "int=1 byte=0x%02X unchanged", *b);
+        return 1;
+    }
 
     if (!VirtualProtect(b, 1, PAGE_EXECUTE_READWRITE, &old)) {
         ShSetError(SH_ERR_UNWRITABLE);
+        ShFp2TraceExit(diag, "int=0 protection=failed");
         return 0;
     }
     *b = want;
     VirtualProtect(b, 1, old, &old);
     FlushInstructionCache(GetCurrentProcess(), b, 1);
     ShSetError(SH_OK);
+    ShFp2TraceExit(diag, "int=1 byte=0x%02X", *b);
     return 1;
 }
 

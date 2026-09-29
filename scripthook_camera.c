@@ -13,6 +13,8 @@
 #define SH_BUILD 1
 #include "scripthook.h"
 #include "image.h"
+#include "fp2_internal.h"
+#include "fp2_timing.h"
 
 /* The projection selector. It takes the camera in RCX and
  * runs every frame, which is what makes it hookable.
@@ -64,7 +66,7 @@ static volatile uint64_t g_cam = 0;
 static volatile uint64_t g_calls = 0;
 static volatile uint64_t g_writes = 0;
 
-/* Diagnostic only. Special views run mode 0 like the main
+/* Special views can run mode 0 like the main
  * camera (measured: the drone), so mode gates nothing.
  */
 static volatile uint64_t g_otherAt = 0;
@@ -74,6 +76,9 @@ static volatile int g_otherMode = 0;
  * its camera is a template: a bit exact identity basis,
  * which no steered camera ever holds. Measured live. */
 static volatile uint64_t g_uiAt = 0;
+static volatile uint64_t g_headNearAt = 0;
+static volatile uint64_t g_headWroteAt = 0;
+static volatile uint64_t g_viewWantAt = 0;
 
 static ShVec3 g_absPos;
 static volatile float g_back = 0.0f;
@@ -86,6 +91,28 @@ static volatile float g_skewX = 0.0f;
 static volatile float g_skewY = 0.0f;
 static volatile int g_modeSet = 0;
 static volatile uint32_t g_apply = 0;
+static volatile LONG g_ffpTrackNextWrite;
+
+void ShFp2CameraStateSnapshot(Fp2CameraState *out) {
+    SIZE_T got = 0;
+    memset(out, 0, sizeof(*out));
+    out->apply = g_apply;
+    out->pos[0] = g_absPos.x;
+    out->pos[1] = g_absPos.y;
+    out->pos[2] = g_absPos.z;
+    out->back = g_back;
+    out->up = g_up;
+    out->yaw = g_yaw;
+    out->pitch = g_pitch;
+    out->roll = g_roll;
+    out->fov = g_fov;
+    out->mode = g_modeSet;
+    out->camera = g_cam;
+    if (out->camera)
+        out->liveValid = ReadProcessMemory(GetCurrentProcess(),
+            (LPCVOID)(uintptr_t)(out->camera + CAM_POSE + 12u*4u),
+            out->live, sizeof(out->live), &got) && got == sizeof(out->live);
+}
 
 static uint8_t *g_camStub = NULL;
 static int g_camHooked;
@@ -103,6 +130,12 @@ extern void ShTransformPump(void);
 extern void ShDominoPump(void);
 extern void ShHeadPump(void);
 extern void ShHeadWant(void);
+extern void ShFp2HeadFrame(void);
+extern void ShFp2WorldFrame(void);
+extern int ShFp2CameraReady(void);
+extern int ShFp2PlaceEye(float *matrix, float *position);
+extern void ShFp2PeekPlacementMissed(void);
+extern int ShFp2OwnsEye(void);
 extern int ShFovSet(float radians);
 extern void ShFovClear(void);
 extern int ShHeadCached(ShVec3 *out);
@@ -263,6 +296,9 @@ static void ApplyHead(float *m, float fov) {
         }
     }
     WritePos(m, px, py, pz);
+    if (px == px && py == py && pz == pz &&
+        fabsf(px) <= 1e6f && fabsf(py) <= 1e6f && fabsf(pz) <= 1e6f)
+        g_headWroteAt = GetTickCount64();
 }
 
 /* Each field is written only if its bit is set, so the
@@ -270,7 +306,9 @@ static void ApplyHead(float *m, float fov) {
  */
 static void ApplyPose(float *m, float fov) {
     if (g_apply & SH_CAM_ROT) WriteRot(m);
-    if (g_apply & CAM_HEAD_BIT) ApplyHead(m, fov);
+    if (g_apply & CAM_HEAD_BIT) {
+        if (!ShFp2OwnsEye()) ApplyHead(m, fov);
+    }
     else if (g_apply & CAM_ORBIT_BIT) ApplyOrbit(m);
     else if (g_apply & SH_CAM_POS)
         WritePos(m, g_absPos.x, g_absPos.y, g_absPos.z);
@@ -294,12 +332,26 @@ static void ApplyFields(uint64_t cam) {
 static void __attribute__((ms_abi)) CamCallback(uint64_t rcx) {
     const float *f;
     int mode, ui;
+    Fp2TimingSample timing;
+    int capture = ShFp2TimingEnabled();
 
-    if (!rcx || !ShReadableAddr(rcx, CAM_FOV + 4)) return;
+    if (capture) ShFp2TimingBegin(&timing, FP2_TIMING_CAMERA, rcx, g_calls + 1);
+
+    if (!rcx || !ShReadableAddr(rcx, CAM_FOV + 4)) {
+        if (capture) { timing.early = 1; ShFp2TimingFinish(&timing); }
+        return;
+    }
     mode = *(const int *)(uintptr_t)(rcx + CAM_MODE);
+    if (capture) timing.mode = mode;
     if (mode != 0) {
         g_otherMode = mode;
         g_otherAt = g_calls;
+        if (capture) {
+            timing.early = 2;
+            timing.handoff = 2;
+            timing.apply = g_apply;
+            ShFp2TimingFinish(&timing);
+        }
         return;
     }
 
@@ -311,21 +363,53 @@ static void __attribute__((ms_abi)) CamCallback(uint64_t rcx) {
          f[4] == 0.0f && f[5] == 1.0f && f[6] == 0.0f &&
          f[8] == 0.0f && f[9] == 0.0f && f[10] == 1.0f;
     if (ui) g_uiAt = g_calls;
+    if (capture) {
+        timing.cameraSequence = g_calls;
+        timing.ui = ui;
+        timing.apply = g_apply;
+        timing.handoff = ui ? 1 : 0;
+    }
 
     /* The engine stamps visibility back here, so a held
      * override is reapplied in the same window.
      */
+    if (capture) timing.visibilityBegin = ShFp2TimingNow();
     ShVisibilityPump();
+    if (capture) timing.visibilityEnd = ShFp2TimingNow();
+    if (capture) timing.transformBegin = ShFp2TimingNow();
     ShTransformPump();
+    if (capture) timing.transformEnd = ShFp2TimingNow();
+    if (capture) timing.dominoBegin = ShFp2TimingNow();
     ShDominoPump();
+    if (capture) timing.dominoEnd = ShFp2TimingNow();
 
     /* The menu camera never takes the head, so its frames
      * do no head work at all. The pump keeps its state and
      * resumes on the first world frame. */
+    if (capture) timing.headBegin = ShFp2TimingNow();
     if (!ui) {
-        if (g_apply & CAM_HEAD_BIT) ShHeadWant();
-        ShHeadPump();
-        if (g_apply) ApplyFields(rcx);
+        uint64_t now = GetTickCount64();
+        if (!ShFp2OwnsEye()) {
+            if ((g_apply & CAM_HEAD_BIT) || now < g_viewWantAt) ShHeadWant();
+            ShHeadPump();
+        }
+        if (now < g_viewWantAt && !ShFp2OwnsEye()) {
+            ShVec3 h;
+            if (ShHeadCached(&h)) {
+                float x = f[12] - h.x, y = f[13] - h.y, z = f[14] - h.z;
+                if (x*x + y*y + z*z < 1.0f) g_headNearAt = now;
+            }
+        }
+        if (capture) timing.headEnd = ShFp2TimingNow();
+        if (g_apply) {
+            if (capture) timing.fieldsBegin = ShFp2TimingNow();
+            ApplyFields(rcx);
+            if (capture) timing.fieldsEnd = ShFp2TimingNow();
+        }
+    }
+    if (capture) {
+        if (ui) timing.headEnd = ShFp2TimingNow();
+        ShFp2TimingFinish(&timing);
     }
 }
 
@@ -334,16 +418,85 @@ static void __attribute__((ms_abi)) CamCallback(uint64_t rcx) {
  * translation. RAX holds the manager at the patch site. */
 static void __attribute__((ms_abi)) MgrCallback(uint64_t cm) {
     float *m, *p;
+    float before[3];
+    int track;
+    Fp2TimingSample timing;
+    int capture = ShFp2TimingEnabled();
 
-    if (!cm || !g_apply) return;
-    if (!ShReadableAddr(cm + MGR_XFORM, 0x40)) return;
+    if (capture) {
+        ShFp2TimingBegin(&timing, FP2_TIMING_MANAGER, cm, g_calls);
+        timing.apply = g_apply;
+        timing.headBegin = ShFp2TimingNow();
+        ShFp2TimingManagerCurrent(&timing);
+    }
+
+    ShFp2WorldFrame();
+    ShFp2HeadFrame();
+    if (!cm || !g_apply) {
+        ShFp2PeekPlacementMissed();
+        if (capture) {
+            timing.early = FP2_TIMING_MGR_NO_CLAIM;
+            timing.headEnd = ShFp2TimingNow(); ShFp2TimingFinish(&timing);
+        }
+        return;
+    }
+    if (!ShReadableAddr(cm + MGR_XFORM, 0x40)) {
+        ShFp2PeekPlacementMissed();
+        if (capture) {
+            timing.early = FP2_TIMING_MGR_UNREADABLE;
+            timing.headEnd = ShFp2TimingNow(); ShFp2TimingFinish(&timing);
+        }
+        return;
+    }
     /* Same identity basis test ShInPauseMenu reports on. */
-    if (g_uiAt != 0 && g_calls - g_uiAt <= 4) return;
+    if (g_uiAt != 0 && g_calls - g_uiAt <= 4) {
+        ShFp2PeekPlacementMissed();
+        if (capture) {
+            timing.early = FP2_TIMING_MGR_UI_RECENT;
+            timing.handoff = 1;
+            timing.headEnd = ShFp2TimingNow(); ShFp2TimingFinish(&timing);
+        }
+        return;
+    }
 
     m = (float *)(uintptr_t)(cm + MGR_XFORM);
     p = (float *)(uintptr_t)(cm + MGR_POS);
+    track = g_ffpTrackNextWrite != 0;
+    if (track) {
+        before[0] = m[12];
+        before[1] = m[13];
+        before[2] = m[14];
+    }
 
+    /* FP2 owns this manager frame outright. A declined menu, drone or
+     * optic frame remains the engine's; do not restate its position. */
+    if ((g_apply & CAM_HEAD_BIT) && ShFp2CameraReady()) {
+        if (ShFp2PlaceEye(m, p)) {
+            if (capture) {
+                timing.transformWritten = 1;
+                timing.positionWritten = 1;
+            }
+            g_headWroteAt = GetTickCount64();
+            g_writes++;
+            if (track && InterlockedCompareExchange(&g_ffpTrackNextWrite,
+                                                     0, 1) == 1)
+                ShFp2TraceManagerWrite(g_apply, before, m + 12);
+        } else if (capture) timing.early = FP2_TIMING_MGR_FP2_DECLINED;
+        if (capture) {
+            timing.headEnd = ShFp2TimingNow();
+            ShFp2TimingFinish(&timing);
+        }
+        return;
+    }
+
+    ShFp2PeekPlacementMissed();
+    if (capture) timing.poseRan = 1;
     ApplyPose(m, *(const float *)(uintptr_t)(cm + MGR_FOV));
+    if (capture) {
+        timing.transformWritten =
+            (g_apply & (SH_CAM_ROT | SH_CAM_POS | CAM_DERIVED)) != 0;
+        timing.headEnd = ShFp2TimingNow();
+    }
 
     /* The engine fills the position vector from a second
      * call, so the row above is restated here rather than
@@ -352,7 +505,11 @@ static void __attribute__((ms_abi)) MgrCallback(uint64_t cm) {
     p[1] = m[13];
     p[2] = m[14];
     p[3] = 0.0f;
+    if (capture) timing.positionWritten = 1;
     g_writes++;
+    if (track && InterlockedCompareExchange(&g_ffpTrackNextWrite, 0, 1) == 1)
+        ShFp2TraceManagerWrite(g_apply, before, m + 12);
+    if (capture) ShFp2TimingFinish(&timing);
 }
 
 /* The site keeps its call opcode, so the stub is entered
@@ -561,7 +718,31 @@ static int ThunkPointsAtStub(void) {
  */
 void ShCameraOnEnterPlaying(void) {
     g_cam = 0;
+    g_headNearAt = 0;
+    g_headWroteAt = 0;
     ShCameraHookInstall();
+}
+
+SH_API int ShCameraViewMode(void) {
+    Fp2TraceToken diag = ShFp2TraceEnter("ShCameraViewMode",
+        __builtin_return_address(0), "-");
+    uint64_t now = GetTickCount64();
+    int result;
+    g_viewWantAt = now + 2000;
+    if (!ShCameraReady() || ShInPauseMenu()) {
+        result = SH_VIEW_UNKNOWN;
+        ShFp2TraceExit(diag, "view=%d", result);
+        return result;
+    }
+    if (((g_apply & CAM_HEAD_BIT) && g_headWroteAt &&
+         now - g_headWroteAt < 250) ||
+        (g_headNearAt && now - g_headNearAt < 250))
+        result = SH_VIEW_FIRST_PERSON;
+    else if (!g_headWroteAt && !g_headNearAt)
+        result = SH_VIEW_UNKNOWN;
+    else result = SH_VIEW_THIRD_PERSON;
+    ShFp2TraceExit(diag, "view=%d", result);
+    return result;
 }
 
 SH_API int ShCameraReady(void) {
@@ -572,7 +753,7 @@ SH_API uint64_t ShCameraCalls(void) { return g_calls; }
 SH_API uint64_t ShCameraWrites(void) { return g_writes; }
 
 /* The last nonzero camera mode seen, and how many mode 0
- * frames ago, so a REPL probe can name the special views.
+ * frames ago, allowing special views to be identified.
  */
 SH_API int ShCameraOtherMode(uint64_t *framesAgo) {
     if (framesAgo) *framesAgo = g_calls - g_otherAt;
@@ -607,11 +788,16 @@ SH_API int ShGetCamera(ShCamera *out) {
 }
 
 SH_API int ShSetCamera(const ShVec3 *pos) {
-    if (!pos) { ShSetError(SH_ERR_BAD_ARG); return 0; }
-    if (!ShCameraHookInstall()) return 0;
+    Fp2TraceToken diag = ShFp2TraceEnter("ShSetCamera",
+        __builtin_return_address(0), "pos=%p xyz=%.6g,%.6g,%.6g",
+        (const void *)pos, pos ? pos->x : 0.0f,
+        pos ? pos->y : 0.0f, pos ? pos->z : 0.0f);
+    if (!pos) { ShSetError(SH_ERR_BAD_ARG); ShFp2TraceExit(diag, "int=0"); return 0; }
+    if (!ShCameraHookInstall()) { ShFp2TraceExit(diag, "int=0"); return 0; }
     g_absPos = *pos;
     g_apply = (g_apply & ~CAM_DERIVED) | SH_CAM_POS;
     ShSetError(SH_OK);
+    ShFp2TraceExit(diag, "int=1");
     return 1;
 }
 
@@ -619,11 +805,14 @@ SH_API int ShSetCamera(const ShVec3 *pos) {
  * and height above. It follows the player because the
  * engine still owns the basis and the position. */
 SH_API int ShCameraOrbit(float back, float up) {
-    if (!ShCameraHookInstall()) return 0;
+    Fp2TraceToken diag = ShFp2TraceEnter("ShCameraOrbit",
+        __builtin_return_address(0), "back=%.6g up=%.6g", back, up);
+    if (!ShCameraHookInstall()) { ShFp2TraceExit(diag, "int=0"); return 0; }
     g_back = back;
     g_up = up;
     g_apply = (g_apply & ~CAM_HEAD_BIT) | SH_CAM_POS | CAM_ORBIT_BIT;
     ShSetError(SH_OK);
+    ShFp2TraceExit(diag, "int=1");
     return 1;
 }
 
@@ -631,11 +820,14 @@ SH_API int ShCameraOrbit(float back, float up) {
  * and eases onto the aim ray during ADS, so sights stay
  * centered. forward clears the face. */
 SH_API int ShCameraFirstPerson(float forward, float up) {
-    if (!ShCameraHookInstall()) return 0;
+    Fp2TraceToken diag = ShFp2TraceEnter("ShCameraFirstPerson",
+        __builtin_return_address(0), "forward=%.6g up=%.6g", forward, up);
+    if (!ShCameraHookInstall()) { ShFp2TraceExit(diag, "int=0"); return 0; }
     g_back = forward;
     g_up = up;
     g_apply = (g_apply & ~CAM_ORBIT_BIT) | SH_CAM_POS | CAM_HEAD_BIT;
     ShSetError(SH_OK);
+    ShFp2TraceExit(diag, "int=1");
     return 1;
 }
 
@@ -643,8 +835,13 @@ SH_API int ShCameraFirstPerson(float forward, float up) {
  * faces +y, pitch is positive looking up.
  */
 SH_API int ShCameraFree(const ShVec3 *pos, float yaw, float pitch) {
-    if (!pos) { ShSetError(SH_ERR_BAD_ARG); return 0; }
-    if (!ShCameraHookInstall()) return 0;
+    Fp2TraceToken diag = ShFp2TraceEnter("ShCameraFree",
+        __builtin_return_address(0),
+        "pos=%p xyz=%.6g,%.6g,%.6g yaw=%.6g pitch=%.6g",
+        (const void *)pos, pos ? pos->x : 0.0f,
+        pos ? pos->y : 0.0f, pos ? pos->z : 0.0f, yaw, pitch);
+    if (!pos) { ShSetError(SH_ERR_BAD_ARG); ShFp2TraceExit(diag, "int=0"); return 0; }
+    if (!ShCameraHookInstall()) { ShFp2TraceExit(diag, "int=0"); return 0; }
     if (pitch > 1.55f) pitch = 1.55f;
     if (pitch < -1.55f) pitch = -1.55f;
     g_absPos = *pos;
@@ -652,6 +849,7 @@ SH_API int ShCameraFree(const ShVec3 *pos, float yaw, float pitch) {
     g_pitch = pitch;
     g_apply = (g_apply & ~CAM_DERIVED) | SH_CAM_POS | SH_CAM_ROT;
     ShSetError(SH_OK);
+    ShFp2TraceExit(diag, "int=1");
     return 1;
 }
 
@@ -673,8 +871,17 @@ SH_API int ShCameraAngles(float *yaw, float *pitch) {
 }
 
 SH_API int ShCameraApply(const ShCameraOverride *o) {
-    if (!o || !o->apply) { ShSetError(SH_ERR_BAD_ARG); return 0; }
-    if (!ShCameraHookInstall()) return 0;
+    Fp2TraceToken diag = ShFp2TraceEnter("ShCameraApply",
+        __builtin_return_address(0),
+        "override=%p mask=0x%X pos=%.6g,%.6g,%.6g yaw=%.6g "
+        "pitch=%.6g roll=%.6g fov=%.6g mode=%d",
+        (const void *)o, o ? o->apply : 0u,
+        o ? o->pos.x : 0.0f, o ? o->pos.y : 0.0f,
+        o ? o->pos.z : 0.0f, o ? o->yaw : 0.0f,
+        o ? o->pitch : 0.0f, o ? o->roll : 0.0f,
+        o ? o->fov : 0.0f, o ? o->mode : 0);
+    if (!o || !o->apply) { ShSetError(SH_ERR_BAD_ARG); ShFp2TraceExit(diag, "int=0"); return 0; }
+    if (!ShCameraHookInstall()) { ShFp2TraceExit(diag, "int=0"); return 0; }
 
     if (o->apply & SH_CAM_POS) g_absPos = o->pos;
     if (o->apply & SH_CAM_ROT) {
@@ -689,6 +896,7 @@ SH_API int ShCameraApply(const ShCameraOverride *o) {
         g_fov = o->fov;
         if (!ShFovSet(o->fov)) {
             ShSetError(SH_ERR_NO_CANDIDATE);
+            ShFp2TraceExit(diag, "int=0 fov_set=failed");
             return 0;
         }
     }
@@ -704,6 +912,7 @@ SH_API int ShCameraApply(const ShCameraOverride *o) {
     if (o->apply & SH_CAM_POS) g_apply &= ~CAM_DERIVED;
     g_apply |= o->apply;
     ShSetError(SH_OK);
+    ShFp2TraceExit(diag, "int=1");
     return 1;
 }
 
@@ -727,17 +936,28 @@ SH_API int ShCameraMatrix(int index, float *out16) {
 }
 
 SH_API void ShCameraRelease(void) {
+    Fp2TraceToken diag = ShFp2TraceEnter("ShCameraRelease",
+        __builtin_return_address(0), "-");
     g_apply = 0;
     ShFovClear();
+    ShFp2TraceExit(diag, "void");
 }
 
 /* Give back only what you took, so releasing a free camera
  * leaves another plugin's fov override running.
  */
 SH_API void ShCameraReleaseFields(uint32_t fields) {
+    Fp2TraceToken diag = ShFp2TraceEnter("ShCameraReleaseFields",
+        __builtin_return_address(0), "fields=0x%X", fields);
+    if ((fields & CAM_HEAD_BIT) && (g_apply & CAM_HEAD_BIT))
+        fields |= SH_CAM_POS;
     if (fields & SH_CAM_POS) fields |= CAM_DERIVED;
     if (fields & SH_CAM_FOV) ShFovClear();
     g_apply &= ~fields;
+    if (diag.sequence && (g_apply & SH_CAM_POS) &&
+        !(g_apply & CAM_DERIVED))
+        InterlockedExchange(&g_ffpTrackNextWrite, 1);
+    ShFp2TraceExit(diag, "void effective_fields=0x%X", fields);
 }
 
 /** Which fields are currently overridden. */

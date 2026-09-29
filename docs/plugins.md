@@ -73,22 +73,20 @@ SH_API int ShRegisterFrameCallback(ShFrameFn_t fn, void *user);
 SH_API void ShUnregisterFrameCallback(ShFrameFn_t fn);
 ```
 
-These existing public APIs are restored and currently implemented/validated on
-TU25. Registration supports up to 16 slots and returns 0 when full or when the
-build/signature validation or hook installation fails. Unsupported builds and
-signature mismatches refuse registration.
+These existing public APIs are restored for TU25. Registration supports up to
+16 slots and returns 0 when full or when build/signature validation or hook
+installation fails. Unsupported builds and signature mismatches refuse
+registration.
 
 Callbacks run synchronously on the engine frame-trigger execution path; the
-frame waits for completion. Keep callbacks short and nonblocking. Validation
-covered read-only `ShGetPlayerPosition` and `ShGetCamera` calls, not arbitrary
-engine, physics, queued, or UI operations. Do not infer that every API can safely
-be called from a frame callback. The executing engine thread can vary.
+frame waits for completion. Keep callbacks short and nonblocking. Do not assume
+that every API is safe to call from a frame callback; follow the threading and
+ownership rules documented for each API. The executing engine thread can vary.
 
 Unregistration removes matching function pointers. It is not a synchronization
 barrier and does not guarantee that an already-running callback has completed.
 Do not free callback data or unload its code while execution could still be in
-flight. Controlled tests observed no subsequent callbacks after unregister;
-this does not establish a stronger concurrent-unregister guarantee.
+flight.
 
 ## Rules that hold across the API
 

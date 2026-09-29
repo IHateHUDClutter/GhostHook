@@ -68,6 +68,29 @@ static uint64_t ReadQ(uint64_t addr) {
     return v;
 }
 
+/* This is the same player-slot root already used by scripthook_api.c.
+ * image.h translates its legacy RVA for TU25. */
+#define SH_INPUT_ROOT       SH_IMG(0x4D84E98)
+#define OFF_CTX_DISPATCHER  0x258
+#define OFF_CTX_ACTIVE      0x9C0
+/* Private compatibility bounds; the public GhostHook header stays unchanged. */
+#define SH_CTX_EMPTY        0
+#define SH_CTX_POPUP        11
+
+SH_API int ShInputContext(void) {
+    uint64_t root, dispatcher;
+    int32_t raw;
+    if (!Readable(SH_INPUT_ROOT, 8)) return -1;
+    root = ReadQ(SH_INPUT_ROOT);
+    if (!Sane(root) || !Readable(root + OFF_CTX_DISPATCHER, 8))
+        return -1;
+    dispatcher = ReadQ(root + OFF_CTX_DISPATCHER);
+    if (!Sane(dispatcher) || !Readable(dispatcher + OFF_CTX_ACTIVE, 4))
+        return -1;
+    memcpy(&raw, (void *)(uintptr_t)(dispatcher + OFF_CTX_ACTIVE), 4);
+    return raw >= SH_CTX_EMPTY && raw <= SH_CTX_POPUP ? (int)raw : -1;
+}
+
 uint64_t ShGetStateMachine(void) {
     uint64_t holder, m;
 
@@ -230,10 +253,7 @@ static void TrackState(uint32_t h) {
     InterlockedExchange(&busy, 0);
 }
 
-SH_API int ShGetGameState(void) {
-    uint32_t h = StateHash(CurrentState());
-
-    TrackState(h);
+static int StateFromHash(uint32_t h) {
     if (h == HASH_PLAYING || h == HASH_INGAME) {
         /* the flow stays Playing through all of these */
         uint32_t ui = ShGetUiState();
@@ -251,6 +271,21 @@ SH_API int ShGetGameState(void) {
     if (h == HASH_LOADING) return SH_STATE_LOADING;
     if (h == HASH_ENDOFGAME) return SH_STATE_MENU;
     return SH_STATE_UNKNOWN;
+}
+
+/* Published by the existing watcher after its transition dispatch. The
+ * camera frame only reads this scalar; it never walks scenes or calls the
+ * state machine's virtual method. */
+static volatile LONG g_observedState = SH_STATE_UNKNOWN;
+
+int ShStateReadOnly(void) {
+    return InterlockedCompareExchange(&g_observedState, 0, 0);
+}
+
+SH_API int ShGetGameState(void) {
+    uint32_t h = StateHash(CurrentState());
+    TrackState(h);
+    return StateFromHash(h);
 }
 
 /* Paused still counts: the world is loaded and every read
@@ -273,7 +308,9 @@ static DWORD WINAPI StateWatchThread(LPVOID p) {
 
     (void)p;
     for (;;) {
-        TrackState(StateHash(CurrentState()));
+        uint32_t h = StateHash(CurrentState());
+        TrackState(h);
+        InterlockedExchange(&g_observedState, StateFromHash(h));
         if (++tick >= 20) { tick = 0; ShCrashRearm(); }
         Sleep(100);
     }

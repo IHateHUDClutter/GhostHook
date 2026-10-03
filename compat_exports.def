@@ -297,3 +297,4 @@ EXPORTS
     ShFp2HeadShow @295
     ShInputContext @296
     ShGameFocused @297
+    ShCameraOrbitAdvanced @298

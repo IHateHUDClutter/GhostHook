@@ -321,7 +321,7 @@ static int CtrlAlive(uint64_t ctrl, uint64_t entity) {
 static int SixHeadNodesValidated(uint64_t controller, uint64_t entity,
                            int *headCount);
 
-/* The pinned Reforged chain is bounded to nine pointer reads and one tag.
+/* The pinned plugin chain is bounded to nine pointer reads and one tag.
  * It is a candidate source only; current-player and six-node checks follow. */
 static uint64_t BoundedHeadCandidate(const char **reason) {
     uint64_t a, c, candidate;
@@ -807,7 +807,7 @@ static uint64_t ImmediateProbeRead(int step, uint64_t address) {
     return value;
 }
 
-static void ProbeReforgedHeadRoot(uint64_t entity) {
+static void ProbeCompatibleHeadRoot(uint64_t entity) {
     uint64_t root = SH_IMG(0x4B90638), a, c, node = 0;
     AdsTraceChainCapture capture = {0};
     uint16_t tag = 0;
@@ -820,7 +820,7 @@ static void ProbeReforgedHeadRoot(uint64_t entity) {
     capture.player = entity;
     capture.epoch = epoch;
     ShFp2TraceAdsEvent(FFP_ADS_TRACE_CHAIN_STEP,
-        "source=pinned_reforged_legacy_head_root "
+        "source=legacy_head_root "
         "epoch=%ld slot=0x%llX read_only=1",
         (long)epoch, (unsigned long long)root);
     a = ImmediateProbeRead(step++, root); if (!a) goto done;
@@ -1038,7 +1038,7 @@ static int AcquireFp2Head(uint64_t entity, const char *reason) {
     }
     priorCtrl = g_headEnt == entity ? g_headCtrl : 0;
     adsCandidate = ShFp2NativeHeadCandidate();
-    ProbeReforgedHeadRoot(entity);
+    ProbeCompatibleHeadRoot(entity);
     n = GetHeadNodesInternal(entity, heads, 64, 0);
     if (priorCtrl && priorCtrl == g_headCtrl) source = "existing_cache";
     else if (adsCandidate && adsCandidate == g_headCtrl)

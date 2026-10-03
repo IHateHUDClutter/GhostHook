@@ -33,6 +33,7 @@ static uint32_t g_poolRva;
 static volatile LONG g_pluginsLoaded;
 
 extern void ShStateStartup(void);
+extern void ShOverlayStart(void);
 extern void ShCrashStartup(void);
 extern void ShWrapDirectInput(void *di);
 
@@ -675,6 +676,7 @@ static DWORD WINAPI LoaderThread(
 {
     (void)p;
 
+    ShOverlayStart();
     LoadASIPlugins();
     return 0;
 }

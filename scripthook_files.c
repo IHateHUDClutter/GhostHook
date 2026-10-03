@@ -1,5 +1,5 @@
-/* Scoped Reforged file rules for Skip Intro: OPEN and ATTR only.
- * The public layouts and six Win32 targets follow pinned Reforged
+/* Scoped plugin file rules for Skip Intro: OPEN and ATTR only.
+ * The public layouts and six Win32 targets follow pinned plugin
  * 4359412559db795d1d13ab086f6355e6fa39c8f5. No GRW site is patched. */
 #include <windows.h>
 #include <stdint.h>

@@ -71,7 +71,7 @@ static void CopyText(char *dst, size_t cap, const char *src) {
     dst[cap - 1] = 0;
 }
 
-/* Reforged searches the declaring owner first, then framework rows.
+/* plugin searches the declaring owner first, then framework rows.
  * Declared rows are copied here so a plugin's temporary input cannot dangle. */
 static const char *BaseFind(const char *owner, const char *lang,
                             const char *key) {
@@ -484,7 +484,7 @@ SH_API int ShLangBuiltin(int index, char *buf, int size) {
     return n >= 0 && n < size;
 }
 
-/* Reforged's formatter uses the en-US conversion list as the argument
+/* Compatible plugins' formatter uses the en-US conversion list as the argument
  * contract. A malformed or mistyped translation falls back to en-US. */
 typedef enum {
     CK_INT, CK_LONG, CK_LLONG, CK_DOUBLE, CK_LDOUBLE,

@@ -167,7 +167,7 @@ static int HeadWritable(uint64_t address, size_t len) {
     return offset <= mbi.RegionSize && len <= mbi.RegionSize - offset;
 }
 
-/* Reforged's live head argument for FN_VIS, not a six-node controller. */
+/* Compatible plugins' live head argument for FN_VIS, not a six-node controller. */
 static uint64_t HeadPtrChain(unsigned *tagOut, const char **failure) {
     uint64_t a, c;
     uint16_t tag;

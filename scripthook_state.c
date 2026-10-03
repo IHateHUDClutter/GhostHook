@@ -22,7 +22,7 @@
 #define VT_GETDESC      0x30
 #define OFF_DESC_HASH   0x24
 
-/* Class hashes, confirmed live in game. */
+/* Class hashes. */
 #define HASH_MENU       0xD638A0D9u
 #define HASH_PLAYING    0x8816ABC6u
 #define HASH_INGAME     0xB5888AF6u

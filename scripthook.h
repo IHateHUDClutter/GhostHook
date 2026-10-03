@@ -23,7 +23,7 @@ extern "C" {
 #define SH_API
 #endif
 
-/* Reforged FOV Changer compatibility. Only its two blocked modes are exposed. */
+/* plugin FOV Changer compatibility. Only its two blocked modes are exposed. */
 enum ShCameraViewModeValue {
     SH_VIEW_UNKNOWN = 0,
     SH_VIEW_FIRST_PERSON = 1,
@@ -102,7 +102,7 @@ SH_API int      ShInBinocular(void);
 
 /** @} */
 /** @defgroup files File interception (OPEN and ATTR)
- *  The callback and descriptor layouts match the pinned Reforged API. @{ */
+ *  The callback and descriptor layouts match the pinned plugin API. @{ */
 
 #define SH_FILE_HIDE     1
 #define SH_FILE_OPEN     0x0001u
@@ -685,7 +685,7 @@ SH_API int  ShMenuIsShowing(uint32_t menu);
 SH_API void ShMenuOpen(int open);
 
 /** @} */
-/** @defgroup reforged_framework Reforged framework compatibility
+/** @defgroup plugin_framework plugin framework compatibility
  *  Additive configuration, paths and localization.
  *  @{ */
 

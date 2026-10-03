@@ -1,0 +1,3 @@
+#include "resource.h"
+
+IDR_GHOSTHOOK_LOGO RCDATA "assets/ghosthook_logo.png"

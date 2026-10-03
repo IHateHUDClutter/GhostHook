@@ -1,14 +1,19 @@
 /* A shared menu, one root owned by the API. Every plugin
- * registers a submenu, so sixteen addons cost sixteen rows.
- * Drawn by the engine itself through the native UI. */
+ * registers a submenu, so sixteen addons cost sixteen rows. */
 #include <windows.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #define SH_BUILD 1
 #include "scripthook.h"
+#include "scripthook_menu_overlay.h"
+
+#ifndef SH_MENU_OVERLAY_ENABLED
+#define SH_MENU_OVERLAY_ENABLED 0
+#endif
 
 extern void ShMenuSuppressKeys(int on, int toggleVk);
 extern void ShLangCopyMenu(const char *owner, const char *key,
@@ -21,12 +26,12 @@ extern int ShLangHasDeclared(const char *owner, const char *key);
 extern int ShLangFormatMenuV(char *dst, size_t cap, const char *en,
                               const char *tr, va_list ap);
 
-#define MENUS       24
+#define MENUS       128
 #define ITEMS       96
 #define LABEL       48
 #define VISIBLE     12
 #define TICK_MS     40
-#define OPTS        12
+#define OPTS        64
 
 /* Geometry in HUD pixels. */
 #define MENU_X      20.0f
@@ -81,23 +86,8 @@ typedef struct {
 } Menu;
 
 /* What is on screen, so only differences are pushed. */
-typedef struct {
-    char name[LABEL];
-    char value[32];
-    int  shown;
-    int  selected;
-} RowView;
-
-typedef struct {
-    char    title[LABEL];
-    char    hint[384];
-    char    status[96];
-    char    footer[32];
-    int     rows;
-    int     sel;
-    int     isRoot;
-    RowView row[VISIBLE];
-} View;
+typedef ShMenuOverlayRow RowView;
+typedef ShMenuOverlayView View;
 
 static Menu g_menus[MENUS];
 static uint32_t g_root = 0;
@@ -105,6 +95,41 @@ static uint32_t g_settings = 0;
 static int g_scaleChoice = 1;
 static const float g_scaleMultiplier[4] = {0.85f, 1.0f, 1.25f, 1.50f};
 static const char *g_scaleOptions[4] = {"Small", "Default", "Large", "XLarge"};
+static int g_fontChoice = 0;
+static const char *g_fontOptions[6] = {
+    "Segoe UI", "Arial", "Tahoma", "Verdana", "Trebuchet MS", "Georgia"
+};
+static int g_fontSizeChoice = 5;
+static const char *g_fontSizeOptions[8] = {
+    "16", "18", "20", "22", "24", "26", "28", "30"
+};
+static const int g_fontSizes[8] = {16, 18, 20, 22, 24, 26, 28, 30};
+static int g_textColourChoice = 0;
+static const char *g_textColourOptions[8] = {
+    "White", "Light Gray", "Green", "Cyan", "Yellow", "Orange", "Red",
+    "Custom"
+};
+static const unsigned g_textColours[7] = {
+    0xFFFFFFu, 0xD2D2D2u, 0x80E080u, 0x80E8FFu,
+    0xFFE070u, 0xFFA040u, 0xFF7070u
+};
+static int g_customTextColour[3] = {255, 255, 255};
+static int g_backgroundOpacityChoice = 9;
+static const char *g_backgroundOpacityOptions[11] = {
+    "0%", "10%", "20%", "30%", "40%", "50%",
+    "60%", "70%", "80%", "90%", "100%"
+};
+static const unsigned g_backgroundAlpha[11] = {
+    0, 26, 51, 77, 102, 128, 153, 179, 204, 230, 255
+};
+static int g_accentColourChoice = 8;
+static const char *g_accentColourOptions[9] = {
+    "White", "Light Gray", "Green", "Cyan", "Yellow", "Orange", "Red",
+    "Custom", "Default"
+};
+static int g_customAccentColour[3] = {58, 80, 96};
+static int g_openOnStartupChoice = 0;
+static const char *g_yesNoOptions[2] = {"Yes", "No"};
 static volatile uint32_t g_current = 0;
 static volatile int g_open = 0;
 static volatile int g_key = VK_F4;
@@ -112,6 +137,7 @@ static volatile LONG g_greeted = 0;
 static volatile LONG g_playing = 0;
 static volatile LONG g_autoOpenPending = 0;
 static volatile int g_started = 0;
+static volatile LONG g_overlayReady = 0;
 static CRITICAL_SECTION g_lock;
 static volatile int g_lockReady = 0;
 
@@ -529,10 +555,19 @@ failed:
 static void TryAutoOpen(void) {
     Menu *root;
 
-    if (!g_ui.built ||
+    if (
+#if SH_MENU_OVERLAY_ENABLED
+        !InterlockedCompareExchange(&g_overlayReady, 0, 0) ||
+#else
+        !g_ui.built ||
+#endif
         !InterlockedCompareExchange(&g_playing, 0, 0) ||
         !InterlockedCompareExchange(&g_autoOpenPending, 0, 0))
         return;
+    if (g_openOnStartupChoice != 0) {
+        InterlockedExchange(&g_autoOpenPending, 0);
+        return;
+    }
     if (InterlockedCompareExchange(&g_greeted, 0, 0)) {
         InterlockedExchange(&g_autoOpenPending, 0);
         return;
@@ -631,13 +666,19 @@ static void Sync(const View *v) {
 
 /* Keys are polled here, the engine draws the result. */
 static DWORD WINAPI MenuThread(LPVOID p) {
+#if !SH_MENU_OVERLAY_ENABLED
     View v;
+#endif
     (void)p;
 
     for (;;) {
         Sleep(TICK_MS);
 
+#if SH_MENU_OVERLAY_ENABLED
+        if (InterlockedCompareExchange(&g_overlayReady, 0, 0) && Pressed(g_key)) {
+#else
         if (Pressed(g_key)) {
+#endif
             g_open = !g_open;
             if (g_open) {
                 g_current = g_root;
@@ -645,6 +686,18 @@ static DWORD WINAPI MenuThread(LPVOID p) {
             }
             InterlockedExchange(&g_autoOpenPending, 0);
         }
+#if SH_MENU_OVERLAY_ENABLED
+        ShMenuSuppressKeys(g_open &&
+                           InterlockedCompareExchange(&g_overlayReady, 0, 0),
+                           g_key);
+        if (!InterlockedCompareExchange(&g_overlayReady, 0, 0)) continue;
+        TryAutoOpen();
+        if (!g_open) continue;
+
+        Lock();
+        Navigate();
+        Unlock();
+#else
         ShMenuSuppressKeys(g_open, g_key);
         if (g_ui.built && g_ui.gen != ShUiGen()) DropWidgets();
         if (!g_ui.built && !BuildWidgets()) continue;
@@ -677,25 +730,113 @@ static DWORD WINAPI MenuThread(LPVOID p) {
             ShUiShow(g_ui.panel, 1);
             g_ui.shown = 1;
         }
+#endif
     }
     return 0;
 }
 
-static int LoadMenuScaling(void) {
+void ShMenuOverlaySetReady(int ready) {
+    InterlockedExchange(&g_overlayReady, ready ? 1 : 0);
+    if (!ready) ShMenuSuppressKeys(0, g_key);
+}
+
+int ShMenuOverlayCapture(ShMenuOverlayView *view) {
+    if (!view || !g_open ||
+        !InterlockedCompareExchange(&g_overlayReady, 0, 0))
+        return 0;
+    Lock();
+    Capture(view);
+    Unlock();
+    return view->title[0] != 0;
+}
+
+float ShMenuOverlayScale(void) {
+    int choice = g_scaleChoice;
+    if (choice < 0 || choice >= 4) choice = 1;
+    return g_scaleMultiplier[choice];
+}
+
+int ShMenuOverlayFontChoice(void) {
+    int choice = g_fontChoice;
+    return (choice >= 0 && choice < 6) ? choice : 0;
+}
+
+int ShMenuOverlayFontSize(void) {
+    int choice = g_fontSizeChoice;
+    return (choice >= 0 && choice < 8) ? g_fontSizes[choice] : 26;
+}
+
+unsigned ShMenuOverlayTextColour(void) {
+    int choice = g_textColourChoice;
+    if (choice >= 0 && choice < 7) return g_textColours[choice];
+    if (choice == 7)
+        return ((unsigned)g_customTextColour[0] << 16) |
+               ((unsigned)g_customTextColour[1] << 8) |
+               (unsigned)g_customTextColour[2];
+    return 0xFFFFFFu;
+}
+
+unsigned ShMenuOverlayBackgroundAlpha(void) {
+    int choice = g_backgroundOpacityChoice;
+    return (choice >= 0 && choice < 11) ? g_backgroundAlpha[choice] : 230;
+}
+
+unsigned ShMenuOverlayAccentColour(void) {
+    int choice = g_accentColourChoice;
+    if (choice >= 0 && choice < 7) return g_textColours[choice];
+    if (choice == 7)
+        return ((unsigned)g_customAccentColour[0] << 16) |
+               ((unsigned)g_customAccentColour[1] << 8) |
+               (unsigned)g_customAccentColour[2];
+    return 0x3A5060u;
+}
+
+static int LoadFixedChoice(const char *key, const char **options,
+                           int count, int fallback) {
     char value[32];
+    int i;
 
-    if (!ShGhostSettingsGetStr("MenuScaling", value, sizeof(value))) {
-        ShGhostSettingsSetStr("MenuScaling", "Default");
-        return 1;
+    if (ShGhostSettingsGetStr(key, value, sizeof(value))) {
+        for (i = 0; i < count; ++i)
+            if (!_stricmp(value, options[i])) return i;
     }
+    ShGhostSettingsSetStr(key, options[fallback]);
+    return fallback;
+}
 
-    if (!_stricmp(value, "Small")) return 0;
-    if (!_stricmp(value, "Default")) return 1;
-    if (!_stricmp(value, "Large")) return 2;
-    if (!_stricmp(value, "XLarge")) return 3;
+static int LoadMenuScaling(void) {
+    return LoadFixedChoice("MenuScaling", g_scaleOptions, 4, 1);
+}
 
-    ShGhostSettingsSetStr("MenuScaling", "Default");
-    return 1;
+static int LoadColourChannel(const char *key, int fallback) {
+    char value[32];
+    char canonical[16];
+    char *end;
+    long parsed;
+    int corrected = 0;
+
+    if (!ShGhostSettingsGetStr(key, value, sizeof(value))) {
+        snprintf(canonical, sizeof(canonical), "%d", fallback);
+        ShGhostSettingsSetStr(key, canonical);
+        return fallback;
+    }
+    end = NULL;
+    parsed = strtol(value, &end, 10);
+    if (end == value || !end || *end) {
+        parsed = fallback;
+        corrected = 1;
+    } else if (parsed < 0) {
+        parsed = 0;
+        corrected = 1;
+    } else if (parsed > 255) {
+        parsed = 255;
+        corrected = 1;
+    }
+    if (corrected) {
+        snprintf(canonical, sizeof(canonical), "%ld", parsed);
+        ShGhostSettingsSetStr(key, canonical);
+    }
+    return (int)parsed;
 }
 
 static void SetMenuScaling(uint32_t menu, uint32_t item, int value,
@@ -710,25 +851,203 @@ static void SetMenuScaling(uint32_t menu, uint32_t item, int value,
     }
 }
 
+static void SetFont(uint32_t menu, uint32_t item, int value, void *user) {
+    (void)menu;
+    (void)item;
+    (void)user;
+    if (value >= 0 && value < 6) {
+        g_fontChoice = value;
+        ShGhostSettingsSetStr("Font", g_fontOptions[value]);
+    }
+}
+
+static void SetFontSize(uint32_t menu, uint32_t item, int value, void *user) {
+    (void)menu;
+    (void)item;
+    (void)user;
+    if (value >= 0 && value < 8) {
+        g_fontSizeChoice = value;
+        ShGhostSettingsSetStr("FontSize", g_fontSizeOptions[value]);
+    }
+}
+
+static void SetTextColour(uint32_t menu, uint32_t item, int value, void *user) {
+    (void)menu;
+    (void)item;
+    (void)user;
+    if (value >= 0 && value < 8) {
+        g_textColourChoice = value;
+        ShGhostSettingsSetStr("TextColor", g_textColourOptions[value]);
+    }
+}
+
+static void SetCustomTextColour(uint32_t menu, uint32_t item, int value,
+                                void *user) {
+    static const char *keys[3] = {"TextColorR", "TextColorG", "TextColorB"};
+    char text[16];
+    int channel = (int)(uintptr_t)user;
+    (void)menu;
+    (void)item;
+    if (channel < 0 || channel >= 3) return;
+    if (value < 0) value = 0;
+    if (value > 255) value = 255;
+    g_customTextColour[channel] = value;
+    snprintf(text, sizeof(text), "%d", value);
+    ShGhostSettingsSetStr(keys[channel], text);
+}
+
+static void SetBackgroundOpacity(uint32_t menu, uint32_t item, int value,
+                                 void *user) {
+    (void)menu;
+    (void)item;
+    (void)user;
+    if (value >= 0 && value < 11) {
+        g_backgroundOpacityChoice = value;
+        ShGhostSettingsSetStr("BackgroundOpacity",
+                              g_backgroundOpacityOptions[value]);
+    }
+}
+
+static void SetAccentColour(uint32_t menu, uint32_t item, int value,
+                            void *user) {
+    (void)menu;
+    (void)item;
+    (void)user;
+    if (value >= 0 && value < 9) {
+        g_accentColourChoice = value;
+        ShGhostSettingsSetStr("AccentColor", g_accentColourOptions[value]);
+    }
+}
+
+static void SetCustomAccentColour(uint32_t menu, uint32_t item, int value,
+                                  void *user) {
+    static const char *keys[3] = {
+        "AccentColorR", "AccentColorG", "AccentColorB"
+    };
+    char text[16];
+    int channel = (int)(uintptr_t)user;
+    (void)menu;
+    (void)item;
+    if (channel < 0 || channel >= 3) return;
+    if (value < 0) value = 0;
+    if (value > 255) value = 255;
+    g_customAccentColour[channel] = value;
+    snprintf(text, sizeof(text), "%d", value);
+    ShGhostSettingsSetStr(keys[channel], text);
+}
+
+static void SetOpenOnStartup(uint32_t menu, uint32_t item, int value,
+                             void *user) {
+    (void)menu;
+    (void)item;
+    (void)user;
+    if (value >= 0 && value < 2) {
+        g_openOnStartupChoice = value;
+        ShGhostSettingsSetStr("OpenMenuOnStartup", g_yesNoOptions[value]);
+    }
+}
+
+static void SetListOptions(Item *item, const char **options,
+                           int count, int value) {
+    int i;
+    if (!item) return;
+    for (i = 0; i < count; ++i) item->opts[i] = options[i];
+    item->nopts = count;
+    item->value = value;
+}
+
+static void SetNumberOptions(Item *item, int value, int channel) {
+    if (!item) return;
+    item->num = (float)value;
+    item->lo = 0.0f;
+    item->hi = 255.0f;
+    item->step = 5.0f;
+    item->user = (void *)(uintptr_t)channel;
+}
+
 static void EnsureMenu(void) {
     if (g_started) return;
     g_started = 1;
     InitializeCriticalSection(&g_lock);
     g_lockReady = 1;
     g_scaleChoice = LoadMenuScaling();
+    g_fontChoice = LoadFixedChoice("Font", g_fontOptions, 6, 0);
+    g_fontSizeChoice = LoadFixedChoice("FontSize", g_fontSizeOptions, 8, 5);
+    g_textColourChoice = LoadFixedChoice("TextColor", g_textColourOptions, 8, 0);
+    g_customTextColour[0] = LoadColourChannel("TextColorR", 255);
+    g_customTextColour[1] = LoadColourChannel("TextColorG", 255);
+    g_customTextColour[2] = LoadColourChannel("TextColorB", 255);
+    g_backgroundOpacityChoice = LoadFixedChoice(
+        "BackgroundOpacity", g_backgroundOpacityOptions, 11, 9);
+    g_accentColourChoice = LoadFixedChoice(
+        "AccentColor", g_accentColourOptions, 9, 8);
+    g_customAccentColour[0] = LoadColourChannel("AccentColorR", 58);
+    g_customAccentColour[1] = LoadColourChannel("AccentColorG", 80);
+    g_customAccentColour[2] = LoadColourChannel("AccentColorB", 96);
+    g_openOnStartupChoice = LoadFixedChoice(
+        "OpenMenuOnStartup", g_yesNoOptions, 2, 0);
     g_root = NewMenu("GhostHook", 0, "");
     g_settings = NewMenu("GhostHook Settings", g_root, "");
     if (g_settings) {
+        uint32_t custom = NewMenu("Custom Text Color", g_settings, "");
+        uint32_t customAccent = NewMenu("Custom Accent Color", g_settings, "");
         Item *row = NewItem(MenuOf(g_root), IT_SUB,
                             "GhostHook Settings", NULL, NULL);
         Item *scale = NewItem(MenuOf(g_settings), IT_LIST,
                               "Menu Scaling", SetMenuScaling, NULL);
-        int i;
+        Item *font = NewItem(MenuOf(g_settings), IT_LIST,
+                             "Font", SetFont, NULL);
+        Item *fontSize = NewItem(MenuOf(g_settings), IT_LIST,
+                                 "Font Size", SetFontSize, NULL);
+        Item *textColour = NewItem(MenuOf(g_settings), IT_LIST,
+                                   "Text Color", SetTextColour, NULL);
+        Item *customRow = NewItem(MenuOf(g_settings), IT_SUB,
+                                  "Custom Text Color", NULL, NULL);
+        Item *backgroundOpacity = NewItem(MenuOf(g_settings), IT_LIST,
+                                          "Background Opacity",
+                                          SetBackgroundOpacity, NULL);
+        Item *accentColour = NewItem(MenuOf(g_settings), IT_LIST,
+                                     "Accent Color", SetAccentColour, NULL);
+        Item *customAccentRow = NewItem(MenuOf(g_settings), IT_SUB,
+                                        "Custom Accent Color", NULL, NULL);
+        Item *openOnStartup = NewItem(MenuOf(g_settings), IT_LIST,
+                                      "Open Menu on Startup",
+                                      SetOpenOnStartup, NULL);
         if (row) row->sub = g_settings;
-        if (scale) {
-            for (i = 0; i < 4; ++i) scale->opts[i] = g_scaleOptions[i];
-            scale->nopts = 4;
-            scale->value = g_scaleChoice;
+        if (customRow) customRow->sub = custom;
+        if (customAccentRow) customAccentRow->sub = customAccent;
+        SetListOptions(scale, g_scaleOptions, 4, g_scaleChoice);
+        SetListOptions(font, g_fontOptions, 6, g_fontChoice);
+        SetListOptions(fontSize, g_fontSizeOptions, 8, g_fontSizeChoice);
+        SetListOptions(textColour, g_textColourOptions, 8,
+                       g_textColourChoice);
+        SetListOptions(backgroundOpacity, g_backgroundOpacityOptions, 11,
+                       g_backgroundOpacityChoice);
+        SetListOptions(accentColour, g_accentColourOptions, 9,
+                       g_accentColourChoice);
+        SetListOptions(openOnStartup, g_yesNoOptions, 2,
+                       g_openOnStartupChoice);
+        if (custom) {
+            Item *red = NewItem(MenuOf(custom), IT_NUMBER,
+                                "Red", SetCustomTextColour, NULL);
+            Item *green = NewItem(MenuOf(custom), IT_NUMBER,
+                                  "Green", SetCustomTextColour, NULL);
+            Item *blue = NewItem(MenuOf(custom), IT_NUMBER,
+                                 "Blue", SetCustomTextColour, NULL);
+            SetNumberOptions(red, g_customTextColour[0], 0);
+            SetNumberOptions(green, g_customTextColour[1], 1);
+            SetNumberOptions(blue, g_customTextColour[2], 2);
+        }
+        if (customAccent) {
+            Item *red = NewItem(MenuOf(customAccent), IT_NUMBER,
+                                "Red", SetCustomAccentColour, NULL);
+            Item *green = NewItem(MenuOf(customAccent), IT_NUMBER,
+                                  "Green", SetCustomAccentColour, NULL);
+            Item *blue = NewItem(MenuOf(customAccent), IT_NUMBER,
+                                 "Blue", SetCustomAccentColour, NULL);
+            SetNumberOptions(red, g_customAccentColour[0], 0);
+            SetNumberOptions(green, g_customAccentColour[1], 1);
+            SetNumberOptions(blue, g_customAccentColour[2], 2);
         }
     }
     CreateThread(NULL, 0, MenuThread, NULL, 0, NULL);

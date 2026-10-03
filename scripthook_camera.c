@@ -82,6 +82,7 @@ static volatile uint64_t g_viewWantAt = 0;
 
 static ShVec3 g_absPos;
 static volatile float g_back = 0.0f;
+static volatile float g_right = 0.0f;
 static volatile float g_up = 0.0f;
 static volatile float g_yaw = 0.0f;
 static volatile float g_pitch = 0.0f;
@@ -164,12 +165,19 @@ static void WritePos(float *m, float x, float y, float z) {
  */
 static void ApplyOrbit(float *m) {
     ShVec3 p;
+    float x, y, z, right;
 
     if (!ShGetPlayerPosition(&p)) return;
-    WritePos(m,
-             p.x - m[4] * g_back,
-             p.y - m[5] * g_back,
-             p.z - m[6] * g_back + g_up);
+    x = p.x - m[4] * g_back;
+    y = p.y - m[5] * g_back;
+    z = p.z - m[6] * g_back + g_up;
+    right = g_right;
+    if (right != 0.0f) {
+        x += m[0] * right;
+        y += m[1] * right;
+        z += m[2] * right;
+    }
+    WritePos(m, x, y, z);
 }
 
 /* Game basis: x right, y forward, z up. Rebuilt absolutely
@@ -795,6 +803,7 @@ SH_API int ShSetCamera(const ShVec3 *pos) {
     if (!pos) { ShSetError(SH_ERR_BAD_ARG); ShFp2TraceExit(diag, "int=0"); return 0; }
     if (!ShCameraHookInstall()) { ShFp2TraceExit(diag, "int=0"); return 0; }
     g_absPos = *pos;
+    g_right = 0.0f;
     g_apply = (g_apply & ~CAM_DERIVED) | SH_CAM_POS;
     ShSetError(SH_OK);
     ShFp2TraceExit(diag, "int=1");
@@ -809,10 +818,22 @@ SH_API int ShCameraOrbit(float back, float up) {
         __builtin_return_address(0), "back=%.6g up=%.6g", back, up);
     if (!ShCameraHookInstall()) { ShFp2TraceExit(diag, "int=0"); return 0; }
     g_back = back;
+    g_right = 0.0f;
     g_up = up;
     g_apply = (g_apply & ~CAM_HEAD_BIT) | SH_CAM_POS | CAM_ORBIT_BIT;
     ShSetError(SH_OK);
     ShFp2TraceExit(diag, "int=1");
+    return 1;
+}
+
+/* Private plugin compatibility; offsets use the engine's live basis. */
+SH_API int ShCameraOrbitAdvanced(float back, float right, float up) {
+    if (!ShCameraHookInstall()) return 0;
+    g_back = back;
+    g_right = right;
+    g_up = up;
+    g_apply = (g_apply & ~CAM_HEAD_BIT) | SH_CAM_POS | CAM_ORBIT_BIT;
+    ShSetError(SH_OK);
     return 1;
 }
 
@@ -824,6 +845,7 @@ SH_API int ShCameraFirstPerson(float forward, float up) {
         __builtin_return_address(0), "forward=%.6g up=%.6g", forward, up);
     if (!ShCameraHookInstall()) { ShFp2TraceExit(diag, "int=0"); return 0; }
     g_back = forward;
+    g_right = 0.0f;
     g_up = up;
     g_apply = (g_apply & ~CAM_ORBIT_BIT) | SH_CAM_POS | CAM_HEAD_BIT;
     ShSetError(SH_OK);
@@ -847,6 +869,7 @@ SH_API int ShCameraFree(const ShVec3 *pos, float yaw, float pitch) {
     g_absPos = *pos;
     g_yaw = yaw;
     g_pitch = pitch;
+    g_right = 0.0f;
     g_apply = (g_apply & ~CAM_DERIVED) | SH_CAM_POS | SH_CAM_ROT;
     ShSetError(SH_OK);
     ShFp2TraceExit(diag, "int=1");
@@ -909,7 +932,10 @@ SH_API int ShCameraApply(const ShCameraOverride *o) {
     /* Merged, so applying fov leaves another plugin's
      * position and rotation alone.
      */
-    if (o->apply & SH_CAM_POS) g_apply &= ~CAM_DERIVED;
+    if (o->apply & SH_CAM_POS) {
+        g_right = 0.0f;
+        g_apply &= ~CAM_DERIVED;
+    }
     g_apply |= o->apply;
     ShSetError(SH_OK);
     ShFp2TraceExit(diag, "int=1");
@@ -939,6 +965,7 @@ SH_API void ShCameraRelease(void) {
     Fp2TraceToken diag = ShFp2TraceEnter("ShCameraRelease",
         __builtin_return_address(0), "-");
     g_apply = 0;
+    g_right = 0.0f;
     ShFovClear();
     ShFp2TraceExit(diag, "void");
 }
@@ -954,6 +981,7 @@ SH_API void ShCameraReleaseFields(uint32_t fields) {
     if (fields & SH_CAM_POS) fields |= CAM_DERIVED;
     if (fields & SH_CAM_FOV) ShFovClear();
     g_apply &= ~fields;
+    if (fields & (SH_CAM_POS | CAM_ORBIT_BIT)) g_right = 0.0f;
     if (diag.sequence && (g_apply & SH_CAM_POS) &&
         !(g_apply & CAM_DERIVED))
         InterlockedExchange(&g_ffpTrackNextWrite, 1);

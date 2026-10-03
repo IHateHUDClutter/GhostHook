@@ -1,4 +1,4 @@
-/* Narrow mode gate for the Reforged FOV Changer. The game supplies a
+/* Narrow mode gate for the plugin FOV Changer. The game supplies a
  * CreateGameMode description; an unknown description is never allowed. */
 #include <windows.h>
 #include <stdint.h>
@@ -100,7 +100,7 @@ static void TryInstall(void) {
     InterlockedExchange(&g_hooked, 1);
 }
 
-/* These are Reforged's observed table rows, accepted only after the
+/* These are Compatible plugins' observed table rows, accepted only after the
  * independent TU25 site/proof check above. Unknown rows stay blocked. */
 static int ResolveDescription(void *description) {
     static const uint32_t safe[] = {0x038DC7F0u, 0x038DCD80u,
@@ -125,8 +125,10 @@ static int ResolveDescription(void *description) {
 }
 
 static int Allowed(const Entry *entry, LONG mode) {
+    uint32_t mask = entry ? entry->mask :
+        SH_MODE_BLACKLIST_GHOST_WAR | SH_MODE_BLACKLIST_MERCENARIES;
     return mode != MODE_UNKNOWN &&
-           ((entry->mask & (uint32_t)mode) == 0);
+           ((mask & (uint32_t)mode) == 0);
 }
 
 static DWORD WINAPI ModeThread(void *unused) {
@@ -222,7 +224,7 @@ static Entry *EntryFor(HMODULE module, int create) {
     return &g_entries[g_count++];
 }
 
-/* Reforged's undeclared-plugin default, scoped to the FP2 caller.
+/* Compatible plugins' undeclared-plugin default, scoped to the FP2 caller.
  * It leaves an explicit registration, including FOV Changer's, intact. */
 void ShPluginRegisterDefault(void *address) {
     HMODULE caller = Caller(address);
@@ -273,7 +275,7 @@ SH_API int ShPluginAllowed(void) {
     Start();
     AcquireSRWLockExclusive(&g_lock);
     entry = EntryFor(caller, 0);
-    result = entry ? Allowed(entry, g_mode) : 0;
+    result = Allowed(entry, g_mode);
     ReleaseSRWLockExclusive(&g_lock);
     return result;
 }
